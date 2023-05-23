@@ -1,0 +1,66 @@
+wandb_version: 1
+
+model:
+  desc: null
+  value: BartForConditionalGeneration
+optimizer:
+  desc: null
+  value: AdamW
+criterion:
+  desc: null
+  value: CrossEntropy
+training_set:
+  desc: null
+  value: 1D-Bracket_420.json
+batch_size:
+  desc: null
+  value: 3
+input_size:
+  desc: null
+  value: 128
+batch_eval_count:
+  desc: null
+  value: 1
+num_epochs:
+  desc: null
+  value: 5
+learning_rate:
+  desc: null
+  value: 1.0e-05
+gradient_clipping_max:
+  desc: null
+  value: 1.0
+_wandb:
+  desc: null
+  value:
+    python_version: 3.10.10
+    cli_version: 0.15.2
+    framework: huggingface
+    huggingface_version: 4.27.4
+    is_jupyter_run: false
+    is_kaggle_kernel: false
+    start_time: 1684373535.24664
+    t:
+      1:
+      - 1
+      - 5
+      - 11
+      - 49
+      - 53
+      - 55
+      2:
+      - 1
+      - 5
+      - 11
+      - 49
+      - 53
+      - 55
+      3:
+      - 16
+      - 23
+      4: 3.10.10
+      5: 0.15.2
+      6: 4.27.4
+      8:
+      - 3
+      - 5

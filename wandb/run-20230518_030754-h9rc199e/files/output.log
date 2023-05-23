@@ -1,0 +1,12 @@
+
+Starting Epoch: 0/5
+Traceback (most recent call last):
+  File "C:\Users\MKhal\OneDrive\Desktop\UNI\Bachelorarbeit\DEV\server-export\models\TreeParsing.py", line 241, in <module>
+    main()
+  File "C:\Users\MKhal\OneDrive\Desktop\UNI\Bachelorarbeit\DEV\server-export\models\TreeParsing.py", line 236, in main
+    train(model=model, optimizer=optimizer, criterion=criterion, train=train_set, test=test_set)
+  File "C:\Users\MKhal\OneDrive\Desktop\UNI\Bachelorarbeit\DEV\server-export\models\TreeParsing.py", line 166, in train
+    accuracy = calculate_accuracy(in_ids, outputs.logits)
+  File "C:\Users\MKhal\OneDrive\Desktop\UNI\Bachelorarbeit\DEV\server-export\models\TreeParsing.py", line 121, in calculate_accuracy
+    assert inputs.size() == predicted_indices.size()
+AssertionError
