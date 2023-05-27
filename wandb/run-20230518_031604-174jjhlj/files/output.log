@@ -1,6 +1,0 @@
-
-Starting Epoch: 0/5
-torch.Size([3, 127])
-torch.Size([3, 127, 50265])
-torch.Size([3, 127])
-Batch 1/5843 - Loss: 10.9025

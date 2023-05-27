@@ -5,14 +5,18 @@
         ((He))((goes)((to)((the)(mall))))
 """
 import os.path
+import random
 import re
 import sys
 
+import textdistance
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 import torch
 import wandb
 import numpy as np
+
 from sklearn.model_selection import train_test_split
+
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
 from transformers import BartTokenizer, BartForConditionalGeneration
 from torch.optim import AdamW
@@ -29,7 +33,7 @@ hp.num_epochs = 5
 hp.batch_size = 32
 hp.print_every = 10
 hp.learning_rate = 1e-5
-hp.max_length = 128
+hp.max_length = -1
 hp.max_norm = 5.0
 
 
@@ -99,8 +103,27 @@ def encode_for_tree_parsing(texts, tokenizer, max_length=-1):
 
 
 def split_and_prepare(tokenizer, dataset):
-    inputs = [entry.get("i") for entry in dataset['data']]
-    labels = [entry.get("l") for entry in dataset['data']]
+    # Sort by sequence length, log lengths
+    data = dataset['data']
+    data.sort(key=(lambda entry: len(entry.get('i'))))  # sort by input length
+    set_size = len(data)
+
+
+    # Log data metrics
+    print(f"Dataset input length span: [{len(data[0].get('i'))}, {len(data[set_size - 1].get('i'))}]")
+    sequence_lengths = [[x, len(entry.get('i'))] for (x, entry) in enumerate(data)]
+
+    table = wandb.Table(
+        data=sequence_lengths[::int(set_size/100)],
+        columns=["x", "y"]
+    )
+    wandb.log({
+        "sequence_lengths": wandb.plot.line(table, "x", "y", title="Input Sequence Lengths")
+    })
+
+    # encode inputs & labels
+    inputs = [entry.get("i") for entry in data]
+    labels = [entry.get("l") for entry in data]
     input_ids, input_masks = encode_for_tree_parsing(texts=inputs, tokenizer=tokenizer, max_length=hp.input_size)
     label_ids, label_masks = encode_for_tree_parsing(texts=labels, tokenizer=tokenizer, max_length=hp.input_size)
 
@@ -123,20 +146,28 @@ def calculate_metrics(labels, outputs):
     labels = labels.reshape(-1, 1)
     predicted_indices = torch.argmax(outputs, dim=-1).reshape(-1, 1)
     assert labels.size() == predicted_indices.size()
+
     return np.array([
         accuracy_score(y_true=labels, y_pred=predicted_indices),  # accuracy,
-        precision_score(y_true=labels, y_pred=predicted_indices, average="micro"),  # precision
-        recall_score(y_true=labels, y_pred=predicted_indices, average="micro"),  # recall
-        f1_score(y_true=labels, y_pred=predicted_indices, average="micro")  # f1
+        f1_score(y_true=labels, y_pred=predicted_indices, average="micro"),  # f1
+        calculate_edit_distance(labels, predicted_indices)
+#        count_full_hit_count(labels=labels, predicted=predicted_indices)
     ])
 
 
-def calculate_accuracy(labels, outputs):
-    predicted_indices = torch.argmax(outputs, dim=-1)
-    assert labels.size() == predicted_indices.size()
-    total_tokens = labels.numel()
-    difference_count = torch.nonzero(labels - predicted_indices).size(0)
-    return 1.0 - float(difference_count) / float(total_tokens)
+def count_full_hit_count(labels, predicted):
+    torch.count_nonzero(torch.count_nonzero(labels - predicted, dim=1))
+
+
+def calculate_edit_distance(labels, predicted):
+    index = random.randrange(labels.size(dim=0))
+    return textdistance.levenshtein.distance(labels[index, :].tolist(), predicted[index, :].tolist()) * labels.size(
+        dim=0) / labels.size(dim=1)
+
+
+def calculate_edit_distance_all(labels, predicted):
+    pairs = zip(labels.tolist(), predicted.tolist())
+    return np.sum([textdistance.levenshtein.distance(entry[0], entry[1]) for entry in pairs])
 
 
 # Train & Evaluate Model
@@ -145,7 +176,7 @@ def train(model, optimizer, criterion, train, test):
     for epoch in range(hp.num_epochs):
         model.train()
         total_loss = 0
-        metrics = np.zeros(4)
+        metrics = np.zeros(3)
 
         print("Starting Epoch: {}/{}".format(epoch + 1, hp.num_epochs))
 
@@ -178,32 +209,31 @@ def train(model, optimizer, criterion, train, test):
             optimizer.step()
 
             # print info
-            if (i + 1) % hp.print_every == 0 or (i+1) == len(train["loader"]):
+            if (i + 1) % hp.print_every == 0 or (i + 1) == len(train["loader"]):
                 # for last batch in epoch use residual, else use hp.print_every
-                count = len(train["loader"]) % hp.print_every if (i+1) == len(train["loader"]) else hp.print_every
+                count = hp.print_every if (i + 1) % hp.print_every == 0 else len(train["loader"]) % hp.print_every
                 avg_loss = total_loss / count
                 metrics = metrics / count
-                [accuracy, precision, recall, f1] = metrics
-                print(f"Batch {i + 1}/{len(train['loader'])} - Loss: {avg_loss:.4f}, Accuracy: {accuracy:.4f}, F1: {f1:.4f}")
+                [accuracy, f1, levenshtein] = metrics
+                print(
+                    f"Batch {i + 1}/{len(train['loader'])} - Loss: {avg_loss:.4f}, Accuracy: {accuracy:.4f}, F1: {f1:.4f}")
 
                 wandb.log({
                     "epoch": epoch,
                     "loss": avg_loss,
                     "accuracy": accuracy,
-                    "precision": precision,
-                    "recall": recall,
-                    "f1": f1
+                    "f1": f1,
+                    "levenshtein": levenshtein
                 })
 
                 total_loss = 0
-                metrics = np.zeros(4)
+                metrics = np.zeros(3)
                 if device == "cuda":
                     torch.cuda.empty_cache()
 
         # Evaluate
         model.eval()
         eval_loss = 0
-        eval_acc = 0
         num_eval_steps = 0
         for batch in test['loader']:
             in_ids, in_masks, l_ids, l_masks = batch
@@ -220,18 +250,22 @@ def train(model, optimizer, criterion, train, test):
                                 decoder_attention_mask=l_masks[:, :-1].contiguous(),
                                 labels=l_ids[:, 1:].contiguous())
                 loss = criterion(outputs.logits.reshape(-1, outputs.logits.shape[-1]), l_ids[:, 1:].reshape(-1))
-                eval_loss += loss
-                eval_acc += calculate_accuracy(labels=l_ids[:, 1:].cpu(), outputs=outputs.logits.cpu())
+                eval_loss += loss.item()
+                metrics += calculate_metrics(labels=l_ids[:, 1:].cpu(), outputs=outputs.logits.cpu())
                 num_eval_steps += 1
 
         loss = eval_loss / num_eval_steps
-        acc = eval_acc / num_eval_steps
-        print('Epoch {}: Average Evaluation Loss: {}, Accuracy: {}'.format(epoch + 1, loss, acc))
+        metrics = metrics / num_eval_steps
+        [accuracy, f1, num_hits] = metrics
+        print('Epoch {}: Average Evaluation Loss: {}, Accuracy: {}'.format(epoch + 1, loss, accuracy))
         wandb.log({
             "epoch": epoch,
             "eval_loss": loss,
-            "eval_accuracy": acc
+            "eval_accuracy": accuracy,
+            "eval_f1": f1,
+            "eval_hit%": num_hits
         })
+        metrics = np.zeros(3)
 
 
 def save(name, model, optimizer):
@@ -243,21 +277,16 @@ def save(name, model, optimizer):
 
 
 def main():
-    # Load & Encode Training Data
+    l = torch.tensor([[3, 2, 3], [1, 2, 3]])
+    i = torch.tensor([[1, 3, 3], [1, 2, 3]])
+    print(calculate_edit_distance(l, i))
+
+
+    # Load Training Data and Tokenizer
     training_set_name = "Grammar1_7143222753796263824.json" if (len(sys.argv) == 1) else sys.argv[1]
     tokenizer = BracketTokenizer.from_pretrained('facebook/bart-base')  # Use custom tokenizer
     dataset = load_data(Common.training_folder + training_set_name)  # Load data from file
-    train_set, test_set = split_and_prepare(tokenizer, dataset)
     print("Loaded dataset: " + training_set_name)
-
-    # Define Model
-    model = BartForConditionalGeneration.from_pretrained('facebook/bart-base')  # BART Decoder-Encoder for Seq2Seq
-    model.to(device=hp.device)
-
-    # Initialize optimizer and criterion
-    optimizer = AdamW(model.parameters(), lr=hp.learning_rate)
-    criterion = torch.nn.CrossEntropyLoss()
-    criterion.to(hp.device)
 
     # Initialize weights & biases
     config = {
@@ -279,12 +308,26 @@ def main():
         training_set_name.replace(".json", "")
     ]
     wandb.init(project="Tree Bracketing", config=config, tags=tags)
+    wandb.define_metric("loss", summary='min')
+    wandb.define_metric("accuracy", summary='max')
+
+    # Split and prepare training data
+    train_set, test_set = split_and_prepare(tokenizer, dataset)
+
+    # Define Model
+    model = BartForConditionalGeneration.from_pretrained('facebook/bart-base')  # BART Decoder-Encoder for Seq2Seq
+    model.to(device=hp.device)
+
+    # Initialize optimizer and criterion
+    optimizer = AdamW(model.parameters(), lr=hp.learning_rate)
+    criterion = torch.nn.CrossEntropyLoss()
+    criterion.to(hp.device)
 
     # Start training
     train(model=model, optimizer=optimizer, criterion=criterion, train=train_set, test=test_set)
 
     # Save Model & Optimizer
-    save("test", model=model, optimizer=optimizer)
+    # save("test", model=model, optimizer=optimizer)
 
 
 print("Starting script...")
