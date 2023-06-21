@@ -8,10 +8,12 @@ import os.path
 import random
 import re
 import sys
+import argparse
 
+import torch
 import textdistance
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-import torch
+
 import wandb
 import numpy as np
 
@@ -26,15 +28,32 @@ from operator import itemgetter
 from DataUtil import load_data
 import Common
 
+# Parse script arguments
+parser = argparse.ArgumentParser()
+parser.add_argument('-d', '--set_name', type=str, help="The data set", required=True)
+parser.add_argument('-bs', '--batch_size', type=int, help="Batch size")
+parser.add_argument('-is', '--input_size', type=int, help="Input (and output) Length of the network")
+parser.add_argument('-epochs', '--num_epochs', type=int, help="Epoch count")
+parser.add_argument('-lr', '--learning_rate', type=float, help="Learning rate")
+parser.add_argument('-mn', '--max_norm', type=float, help="Maximal gradient for gradient clipping")
+parser.add_argument('-pe', '--print_every', type=int, help="Frequency of logging results")
+
+args = parser.parse_args()
+
 # Set script Hyper Parameters
 hp = Common.HyperParams()
+Common.overwrite_params(hp, vars(args))
 hp.device = "cuda" if torch.cuda.is_available() else "cpu"  # Check if CUDA is available
+
+print(f"hyper parameters: {vars(hp)}")
+
+'''
 hp.num_epochs = 5
 hp.batch_size = 32
 hp.print_every = 10
-hp.learning_rate = 1e-5
 hp.max_length = -1
 hp.max_norm = 5.0
+'''
 
 
 class BracketTokenizer(BartTokenizer):
@@ -108,13 +127,12 @@ def split_and_prepare(tokenizer, dataset):
     data.sort(key=(lambda entry: len(entry.get('i'))))  # sort by input length
     set_size = len(data)
 
-
     # Log data metrics
     print(f"Dataset input length span: [{len(data[0].get('i'))}, {len(data[set_size - 1].get('i'))}]")
     sequence_lengths = [[x, len(entry.get('i'))] for (x, entry) in enumerate(data)]
 
     table = wandb.Table(
-        data=sequence_lengths[::int(set_size/100)],
+        data=sequence_lengths[::int(set_size / 100)],
         columns=["x", "y"]
     )
     wandb.log({
@@ -150,13 +168,9 @@ def calculate_metrics(labels, outputs):
     return np.array([
         accuracy_score(y_true=labels, y_pred=predicted_indices),  # accuracy,
         f1_score(y_true=labels, y_pred=predicted_indices, average="micro"),  # f1
-        calculate_edit_distance(labels, predicted_indices)
-#        count_full_hit_count(labels=labels, predicted=predicted_indices)
+        calculate_edit_distance(labels, predicted_indices),
+        count_full_hit_percentage(labels=labels, predicted=predicted_indices)
     ])
-
-
-def count_full_hit_count(labels, predicted):
-    torch.count_nonzero(torch.count_nonzero(labels - predicted, dim=1))
 
 
 def calculate_edit_distance(labels, predicted):
@@ -169,18 +183,23 @@ def calculate_edit_distance_all(labels, predicted):
     pairs = zip(labels.tolist(), predicted.tolist())
     return np.sum([textdistance.levenshtein.distance(entry[0], entry[1]) for entry in pairs])
 
+def count_full_hit_percentage(labels, predicted):
+    diff = torch.count_nonzero(labels - predicted, dim=1)
+    non_full_hits = torch.count_nonzero(diff)
+    num_full_hits = labels.size(0) - non_full_hits
+    return num_full_hits.item() / labels.size(0)
 
 # Train & Evaluate Model
-def train(model, optimizer, criterion, train, test):
+def train(model, optimizer, criterion, data_set, is_training=True, num_epochs=hp.num_epochs):
     device = hp.device
-    for epoch in range(hp.num_epochs):
-        model.train()
+    for epoch in range(num_epochs):
+        model.train() if is_training else model.eval()
         total_loss = 0
-        metrics = np.zeros(3)
+        metrics = np.zeros(4)
 
-        print("Starting Epoch: {}/{}".format(epoch + 1, hp.num_epochs))
+        print("Starting Epoch: {}/{}".format(epoch + 1, num_epochs))
 
-        for i, batch in enumerate(train['loader']):
+        for i, batch in enumerate(data_set['loader']):
             in_ids, in_masks, l_ids, l_masks = batch
 
             # Move to device
@@ -201,71 +220,38 @@ def train(model, optimizer, criterion, train, test):
             total_loss += loss.item()
             metrics += calculate_metrics(labels=l_ids[:, 1:].cpu(), outputs=outputs.logits.cpu())
 
-            # back propagate
-            loss.backward()
+            if is_training:
+                # back propagate
+                loss.backward()
 
-            # Apply gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=hp.max_norm)
-            optimizer.step()
+                # Apply gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=hp.max_norm)
+                optimizer.step()
 
             # print info
-            if (i + 1) % hp.print_every == 0 or (i + 1) == len(train["loader"]):
+            if (i + 1) % hp.print_every == 0 or (i + 1) == len(data_set["loader"]):
                 # for last batch in epoch use residual, else use hp.print_every
-                count = hp.print_every if (i + 1) % hp.print_every == 0 else len(train["loader"]) % hp.print_every
+                count = hp.print_every if (i + 1) % hp.print_every == 0 else len(data_set["loader"]) % hp.print_every
                 avg_loss = total_loss / count
                 metrics = metrics / count
-                [accuracy, f1, levenshtein] = metrics
+                [accuracy, f1, levenshtein, full_hit_perc] = metrics
                 print(
-                    f"Batch {i + 1}/{len(train['loader'])} - Loss: {avg_loss:.4f}, Accuracy: {accuracy:.4f}, F1: {f1:.4f}")
+                    f"Batch {i + 1}/{len(data_set['loader'])} - Loss: {avg_loss:.4f}, Accuracy: {accuracy:.4f}, F1: {f1:.4f}")
 
+                prefix = "" if is_training else "eval_"
                 wandb.log({
-                    "epoch": epoch,
-                    "loss": avg_loss,
-                    "accuracy": accuracy,
-                    "f1": f1,
-                    "levenshtein": levenshtein
+                    prefix + "epoch": epoch,
+                    prefix + "loss": avg_loss,
+                    prefix + "accuracy": accuracy,
+                    prefix + "f1": f1,
+                    prefix + "levenshtein": levenshtein,
+                    prefix + "full_hit%": full_hit_perc
                 })
 
                 total_loss = 0
-                metrics = np.zeros(3)
+                metrics = np.zeros(4)
                 if device == "cuda":
                     torch.cuda.empty_cache()
-
-        # Evaluate
-        model.eval()
-        eval_loss = 0
-        num_eval_steps = 0
-        for batch in test['loader']:
-            in_ids, in_masks, l_ids, l_masks = batch
-
-            # Move to Cuda
-            in_ids = in_ids.to(device=device)
-            in_masks = in_masks.to(device=device)
-            l_ids = l_ids.to(device=device)
-            l_masks = l_masks.to(device=device)
-
-            with torch.no_grad():
-                outputs = model(input_ids=in_ids, attention_mask=in_masks,
-                                decoder_input_ids=l_ids[:, :-1].contiguous(),
-                                decoder_attention_mask=l_masks[:, :-1].contiguous(),
-                                labels=l_ids[:, 1:].contiguous())
-                loss = criterion(outputs.logits.reshape(-1, outputs.logits.shape[-1]), l_ids[:, 1:].reshape(-1))
-                eval_loss += loss.item()
-                metrics += calculate_metrics(labels=l_ids[:, 1:].cpu(), outputs=outputs.logits.cpu())
-                num_eval_steps += 1
-
-        loss = eval_loss / num_eval_steps
-        metrics = metrics / num_eval_steps
-        [accuracy, f1, num_hits] = metrics
-        print('Epoch {}: Average Evaluation Loss: {}, Accuracy: {}'.format(epoch + 1, loss, accuracy))
-        wandb.log({
-            "epoch": epoch,
-            "eval_loss": loss,
-            "eval_accuracy": accuracy,
-            "eval_f1": f1,
-            "eval_hit%": num_hits
-        })
-        metrics = np.zeros(3)
 
 
 def save(name, model, optimizer):
@@ -277,13 +263,13 @@ def save(name, model, optimizer):
 
 
 def main():
+    # Testing
     l = torch.tensor([[3, 2, 3], [1, 2, 3]])
     i = torch.tensor([[1, 3, 3], [1, 2, 3]])
     print(calculate_edit_distance(l, i))
 
-
     # Load Training Data and Tokenizer
-    training_set_name = "Grammar1_7143222753796263824.json" if (len(sys.argv) == 1) else sys.argv[1]
+    training_set_name = "Grammar1_7143222753796263824.json" if not args.set_name else args.set_name
     tokenizer = BracketTokenizer.from_pretrained('facebook/bart-base')  # Use custom tokenizer
     dataset = load_data(Common.training_folder + training_set_name)  # Load data from file
     print("Loaded dataset: " + training_set_name)
@@ -324,10 +310,11 @@ def main():
     criterion.to(hp.device)
 
     # Start training
-    train(model=model, optimizer=optimizer, criterion=criterion, train=train_set, test=test_set)
+    train(model=model, optimizer=optimizer, criterion=criterion, data_set=train_set)
+    train(model=model, optimizer=optimizer, criterion=criterion, data_set=test_set, is_training=False, num_epochs=1)
 
     # Save Model & Optimizer
-    # save("test", model=model, optimizer=optimizer)
+    save("test", model=model, optimizer=optimizer)
 
 
 print("Starting script...")
