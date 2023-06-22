@@ -1,12 +1,6 @@
 import os
 import typing
-
-import textdistance
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-
 import torch
-import numpy as np
-import random
 
 dirname = os.path.dirname(__file__)
 training_folder = os.path.join(dirname, ".." + os.sep + "data" + os.sep)
@@ -15,6 +9,7 @@ result_folder = os.path.join(dirname, ".." + os.sep + ".." + os.sep + "server-im
 
 class HyperParams:
     def __init__(self):
+        # default values
         self.device = "cpu"
         self.batch_size = 32
         self.input_size = -1
@@ -47,5 +42,9 @@ def overwrite_params(hps: HyperParams, overwrite: typing.Dict[str, object]):
             hps.print_every = int(val)
     return hps
 
-
-
+def save(name, model, optimizer):
+    torch.save({
+        'model': model.state_dict(),
+        'optimizer': optimizer.state_dict()
+    }, os.path.join(result_folder, name + ".pth"))
+    print("Saved model and optimizer to " + result_folder + " with name: " + name + ".")
