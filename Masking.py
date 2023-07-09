@@ -46,30 +46,35 @@ def count_full_hit_percentage(labels, predicted):
 class ClassificationMetrics(TrainUtil.Metrics):
     def __init__(self):
         super().__init__()
-        self.metrics = np.zeros(3)
+        self.metrics = np.zeros(4)
 
     def update(self, batch, outputs):
-        _, _, labels, _ = batch
+        _, in_masks, labels, _ = batch
+
+        # Move to CPU
+        in_masks = in_masks.cpu().detach()
         labels = labels.cpu().detach()
         outputs = outputs.logits.cpu().detach()
 
         #  Calculate
+        avg_lengths = torch.count_nonzero(in_masks) / in_masks.size(0)
         predicted = torch.argmax(outputs, dim=1)
         acc = accuracy_score(y_true=labels, y_pred=predicted)  # accuracy,
         f1 = f1_score(y_true=labels, y_pred=predicted, average="micro")
         full_hit_perc = count_full_hit_percentage(labels, predicted)  # hit %
 
         # Update
-        self.metrics += np.array([acc, f1, full_hit_perc])
+        self.metrics += np.array([avg_lengths, acc, f1, full_hit_perc])
 
     def print(self, index, set_size, prefix, count, epoch, loss):
         avg_loss = loss / count
         metrics = self.metrics / count
-        [accuracy, f1, full_hit_perc] = metrics
+        [avg_lengths, accuracy, f1, full_hit_perc] = metrics
         print(
-            f"Batch {index}/{set_size} - Loss: {avg_loss:.4f}, Accuracy: {accuracy:.4f}, F1: {f1:.4f}")
+            f"Batch {index}/{set_size} - Loss: {avg_loss:.4f}, Accuracy: {accuracy:.4f}, F1: {f1:.4f}, Lengths: {avg_lengths:.2f}")
 
         wandb.log({
+            prefix + "in_lengths": avg_lengths,
             prefix + "epoch": epoch,
             prefix + "loss": avg_loss,
             prefix + "accuracy": accuracy,
@@ -78,13 +83,13 @@ class ClassificationMetrics(TrainUtil.Metrics):
         })
 
     def reset(self):
-        self.metrics = np.zeros(3)
+        self.metrics = np.zeros(4)
 
 
 class ClassificationTrainer(TrainUtil.Trainer):
 
-    def __init__(self, label_encoder, mask_string="[MASK]"):
-        super().__init__()
+    def __init__(self, hp, label_encoder, mask_string="[MASK]"):
+        super().__init__(hp)
         self.label_encoder = label_encoder
         self.mask_string = mask_string
 
@@ -131,15 +136,16 @@ class ClassificationTrainer(TrainUtil.Trainer):
         loss = criterion(outputs.logits, enc_labels)
         return outputs, loss
 
+
 def main():
+    args, hp = Common.loadParams()
 
     # Initialize Trainer
     label_encoder = LabelEncoder()
-    trainer = ClassificationTrainer(label_encoder=label_encoder)
-    hp = trainer.hp
+    trainer = ClassificationTrainer(hp, label_encoder=label_encoder)
 
     # Load Training Data and Tokenizer
-    training_set_name = "Grammar1_7143222753796263824.json" if not trainer.args.set_name else trainer.args.set_name
+    training_set_name = "Grammar1_7143222753796263824.json" if not args.set_name else args.set_name
     tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
     dataset = load_data(Common.training_folder + training_set_name)  # Load data from file
     print("Loaded dataset: " + training_set_name)
@@ -183,9 +189,12 @@ def main():
     # Initialize metrics
     metrics = ClassificationMetrics()
 
-    # Start training & evaluation
+    # Start training
     trainer.train(model=model, optimizer=optimizer, criterion=criterion, data_set=train_set, metrics=metrics)
-    trainer.train(model=model, optimizer=optimizer, criterion=criterion, data_set=test_set, metrics=metrics, is_training=False)
+
+    # Eval
+    trainer.eval(model=model, optimizer=optimizer, criterion=criterion, data_set=test_set, metrics=metrics,
+                 split_into_two=True)
 
     # Save Model & Optimizer
     name = "MASKING_" + training_set_name.replace(".json", "") + "_" + str(datetime.datetime.now().timestamp())

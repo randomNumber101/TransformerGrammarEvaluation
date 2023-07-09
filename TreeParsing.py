@@ -7,18 +7,25 @@
 import datetime
 import random
 import re
+from enum import Enum
+from typing import List, Union
 
 import textdistance
 import torch
 from sklearn.metrics import accuracy_score, f1_score
+from torch.nn.functional import one_hot
+from torch.nn.utils.rnn import pack_padded_sequence
+from torch.utils.data import TensorDataset
 
+import BaseLines
 import TrainUtil
 import wandb
 import numpy as np
 
-from transformers import BartForConditionalGeneration, BartTokenizer
+from transformers import BartForConditionalGeneration, BartTokenizer, BartConfig
 from torch.optim import AdamW
 
+from BaseLines import TokenEmbedder
 from Common import save
 from DataUtil import load_data
 import Common
@@ -31,14 +38,17 @@ hp.max_length = -1
 hp.max_norm = 5.0
 '''
 
+EPS = 0.05  ## Error EPS
+
 
 class BracketTokenizer(BartTokenizer):
     def __init__(self, *args, **kwargs):
         super(BracketTokenizer, self).__init__(*args, **kwargs, add_prefix_space=True)
         # Regex: Either open bracket with a type (word), closed bracket or a string not containing brackets or space.
-        self.token_pattern = r"\(\w*|\)|[^()\s]+"
+        self.token_pattern = r"\(\w*|\)|[^()\s]|\s+"
         self.bracket_ids = {}
         self.next_bracket_id_index = 0
+        self.bracket_types = set()
 
     # deprecated
     # returns even number for opening brackets and odd for closing. brackets of same type have succeeding numbers.
@@ -50,11 +60,18 @@ class BracketTokenizer(BartTokenizer):
             self.next_bracket_id_index += 2
             return newId + int(not opening)
 
-    def get_bracket_id(self, bracket_type, opening):
+    def get_bracket_token(self, bracket_type, opening):
+        t = None
         if not opening:
-            return ')' + bracket_type
+            t = ')' + bracket_type
         else:
-            return '(' + bracket_type
+            t = '(' + bracket_type
+
+        #if t not in self.bracket_types:
+        #    self.bracket_types.add(t)
+        #    self.add_tokens(t)
+
+        return t
 
     def _tokenize(self, text, **kwargs):
         basicTokens = re.findall(pattern=self.token_pattern, string=text)
@@ -64,14 +81,15 @@ class BracketTokenizer(BartTokenizer):
             if token.startswith("("):
                 bracket_type = token[1:] if len(token) > 1 else "-NONE-"
                 bracket_stack.append(bracket_type)
-                split_tokens.append(self.get_bracket_id(bracket_type=bracket_type, opening=True))
-            elif token == ')':
+                bracket_token = self.get_bracket_token(bracket_type=bracket_type, opening=True)
+                split_tokens.extend(super(BracketTokenizer, self)._tokenize(bracket_token))
+            elif token == ')' and bracket_stack:
                 bracket_type = bracket_stack.pop()
-                split_tokens.append(self.get_bracket_id(bracket_type=bracket_type, opening=False))
+                bracket_token = self.get_bracket_token(bracket_type=bracket_type, opening=False)
+                split_tokens.extend(super(BracketTokenizer, self)._tokenize(bracket_token))
             else:
-                split_tokens.extend(super()._tokenize(token))
+                split_tokens.extend(super(BracketTokenizer, self)._tokenize(token))
         return split_tokens
-
 
 def calculate_edit_distance(labels, predicted):
     index = random.randrange(labels.size(dim=0))
@@ -95,33 +113,52 @@ class TransductionMetrics(TrainUtil.Metrics):
 
     def __init__(self):
         super().__init__()
-        self.metrics = np.zeros(4)
+        self.metrics = np.zeros(5)
+        self.errors = []
 
     def update(self, batch, outputs):
-        _, _, labels, _ = batch
-        labels = labels[:, 1:].reshape(-1, 1).cpu().detach()
-        outputs = outputs.logits.cpu().detach()
-        predicted_indices = torch.argmax(outputs, dim=-1).reshape(-1, 1)
+        input_ids, in_masks, labels, _ = (tensor.cpu().detach() for tensor in batch)
+        outputs = outputs.cpu().detach()
 
+        # Adapt
+        labels = labels[:, 1:]
+        predicted_indices = torch.argmax(outputs, dim=-1)
+
+        # Sample one erroneous prediction
+        error_indices = torch.nonzero(torch.any(predicted_indices != labels, dim=1)).squeeze().squeeze().tolist()
+        if error_indices:
+            if not isinstance(error_indices, list):
+                error_indices = [error_indices]
+            idx = error_indices[random.randrange(len(error_indices))]
+            self.errors.append((input_ids[idx], labels[idx], predicted_indices[idx]))
+
+        labels = labels.reshape(-1, 1)
+        predicted_indices = predicted_indices.reshape(-1, 1)
         assert labels.size() == predicted_indices.size(), f"{labels.size()} != {predicted_indices.size()}"
 
         #  Calculate
+        avg_length = torch.count_nonzero(in_masks) / in_masks.size(0)
         acc = accuracy_score(y_true=labels, y_pred=predicted_indices)  # accuracy,
         f1 = f1_score(y_true=labels, y_pred=predicted_indices, average="micro")  # f1
         edit_dist = calculate_edit_distance(labels, predicted_indices)  # levenshtein
         full_hit_perc = count_full_hit_percentage(labels=labels, predicted=predicted_indices)  # full hits
 
         # Update
-        self.metrics += np.array([acc, f1, edit_dist, full_hit_perc])
+        self.metrics += np.array([avg_length, acc, f1, edit_dist, full_hit_perc])
 
-    def print(self, index, set_size, prefix, count, epoch, loss):
+    def print(self, index, set_size, prefix, count, epoch, loss, decoder=None):
         avg_loss = loss / count
         metrics = self.metrics / count
-        [accuracy, f1, levenshtein, full_hit_perc] = metrics
+        [avg_length, accuracy, f1, levenshtein, full_hit_perc] = metrics
         print(
-            f"Batch {index}/{set_size} - Loss: {avg_loss:.4f}, Accuracy: {accuracy:.4f}, F1: {f1:.4f}")
+            f"Batch {index}/{set_size} - Loss: {avg_loss:.4f}, Accuracy: {accuracy:.4f}, F1: {f1:.4f}, Lengths : {avg_length:.2f}")
+
+        error = self.errors[random.randrange(len(self.errors))]
+        inp, label, pred = (decoder(ids) for ids in error)
+        print(f"IN: \n\t{inp} \nOUT: \n\t{pred} \nTRUE: \n\t{label}\n")
 
         wandb.log({
+            prefix + "in_lengths": avg_length,
             prefix + "epoch": epoch,
             prefix + "loss": avg_loss,
             prefix + "accuracy": accuracy,
@@ -131,13 +168,19 @@ class TransductionMetrics(TrainUtil.Metrics):
         })
 
     def reset(self):
-        self.metrics = np.zeros(4)
+        self.metrics = np.zeros(5)
+        self.errors = []
 
 
 class TransductionTrainer(TrainUtil.Trainer):
+    def __init__(self, hp):
+        super().__init__(hp)
 
-    def __init__(self):
-        super().__init__()
+    def decode_tokens(self, tokenizer: BartTokenizer, ids) -> str | list[str]:
+        if len(ids.size()) == 1:
+            return tokenizer.decode(ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+        return [tokenizer.decode(ids[i], skip_special_tokens=True, clean_up_tokenization_spaces=True) for i in
+                range(ids.size(0))]
 
     def encode(self, inputs, labels, tokenizer):
         in_ids = []
@@ -153,7 +196,7 @@ class TransductionTrainer(TrainUtil.Trainer):
                                               max_length=max_length,
                                               return_attention_mask=True, return_tensors='pt')
 
-            encoded_l = tokenizer.encode_plus(i, add_special_tokens=True, padding='max_length',
+            encoded_l = tokenizer.encode_plus(l, add_special_tokens=True, padding='max_length',
                                               max_length=max_length,
                                               return_attention_mask=True, return_tensors='pt')
 
@@ -184,24 +227,150 @@ class TransductionTrainer(TrainUtil.Trainer):
                         labels=l_ids[:, 1:].contiguous())
 
         loss = criterion(outputs.logits.reshape(-1, outputs.logits.shape[-1]), l_ids[:, 1:].reshape(-1))
-        return outputs, loss
+        return outputs.logits, loss
+
+    def eval(self, model, optimizer, tokenizer, criterion, data_set, metrics: TrainUtil.Metrics, split_into_two=False, log_prefix=None):
+        super(TransductionTrainer, self).eval(model, optimizer, tokenizer, criterion, data_set, metrics, split_into_two, log_prefix)
+
+        # Model specific evaluation
 
 
-def main():
-    # Initialize Trainer
-    trainer = TransductionTrainer()
-    hp = trainer.hp
-    args = trainer.args
 
-    # Load Training Data and Tokenizer
-    training_set_name = "Grammar1_7143222753796263824.json" if not args.set_name else args.set_name
+class LSTMTransductionMetrics(TrainUtil.Metrics):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+        self.metrics = np.zeros(5)
+        self.generator = model.generator
+        self.errors = []
+
+    def update(self, batch, outputs):
+
+        # input_ids, in_masks, labels, _ = batch
+        # in_masks = in_masks.cpu().detach()
+
+        # Find nearest
+        with torch.no_grad():
+            predicted_indices = self.generator(outputs)
+            predicted_indices = torch.argmax(predicted_indices, dim=-1)
+
+        # Move to CPU
+        input_ids, in_masks, labels, _ = (tensor.cpu().detach() for tensor in batch)
+        predicted_indices = predicted_indices.cpu().detach()
+
+        # Sample one erroneous prediction
+        error_indices = torch.nonzero(torch.any(predicted_indices != labels, dim=1)).squeeze().tolist()
+        if error_indices:
+            if not isinstance(error_indices, list):
+                error_indices = [error_indices]
+            idx = error_indices[random.randrange(len(error_indices))]
+            self.errors.append((input_ids[idx], labels[idx], predicted_indices[idx]))
+
+        labels = labels.reshape(-1, 1)
+        predicted_indices = predicted_indices.reshape(-1, 1)
+
+        assert labels.size() == predicted_indices.size(), f"{labels.size()} != {predicted_indices.size()}"
+
+        #  Calculate
+        avg_length = torch.count_nonzero(in_masks) / in_masks.size(0)
+        acc = accuracy_score(y_true=labels, y_pred=predicted_indices)  # accuracy,
+        f1 = f1_score(y_true=labels, y_pred=predicted_indices, average="micro")  # f1
+        edit_dist = calculate_edit_distance(labels, predicted_indices)  # levenshtein
+        full_hit_perc = count_full_hit_percentage(labels=labels, predicted=predicted_indices)  # full hits
+
+        # Update
+        self.metrics += np.array([avg_length, acc, f1, edit_dist, full_hit_perc])
+
+    def print(self, index, set_size, prefix, count, epoch, loss, decoder=None):
+        avg_loss = loss / count
+        metrics = self.metrics / count
+        [avg_length, accuracy, f1, levenshtein, full_hit_perc] = metrics
+        print(
+            f"Batch {index}/{set_size} - Loss: {avg_loss:.4f}, Accuracy: {accuracy:.4f}, F1: {f1:.4f}, Lengths: {avg_length:.2f}")
+
+        error = self.errors[random.randrange(len(self.errors))]
+        inp, label, pred = (decoder(ids) for ids in error)
+        print(f"IN: \n\t{inp} \nOUT: \n\t{pred} \nTRUE: \n\t{label}\n")
+
+        wandb.log({
+            prefix + "in_lengths": avg_length,
+            prefix + "epoch": epoch,
+            prefix + "loss": avg_loss,
+            prefix + "accuracy": accuracy,
+            prefix + "f1": f1,
+            prefix + "levenshtein": levenshtein,
+            prefix + "full_hit%": full_hit_perc
+        })
+
+    def reset(self):
+        self.metrics = np.zeros(5)
+        self.errors = []
+
+
+class Seq2SeqLSTMTrainer(TransductionTrainer):
+    def __init__(self, hp: Common.HyperParams, tokenizer: BartTokenizer):
+        super(Seq2SeqLSTMTrainer, self).__init__(hp)
+        self.tokenizer = tokenizer
+
+    def decode_tokens(self, tokenizer: BartTokenizer, ids) -> str | list[str]:
+        if len(ids.size()) == 1:
+            return tokenizer.decode(ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+        return [tokenizer.decode(ids[i], skip_special_tokens=True, clean_up_tokenization_spaces=True) for i in
+                range(ids.size(0))]
+
+    def encode(self, inputs, labels, tokenizer):
+        self.tokenizer = tokenizer
+        r = super().encode(inputs, labels, tokenizer)
+        return r
+
+    def forward_to_model(self, model, criterion, batch):
+        in_ids, in_masks, l_ids, l_masks = batch
+        pad_id = self.tokenizer.convert_tokens_to_ids(self.tokenizer.pad_token)
+        seq_length = in_ids.size(1)
+
+        def num_pad_token(t):
+            return torch.eq(t, pad_id).sum().item()
+
+        def true_lengths(ids):
+            return torch.tensor(
+                [seq_length - num_pad_token(ids[b, :]) for b in range(ids.size(0))]
+            )
+
+        # Calculate Lengths
+        in_len = true_lengths(in_ids)
+        l_len = true_lengths(l_ids)
+
+        # Create packed
+        packed_in = pack_padded_sequence(in_ids, lengths=in_len, batch_first=True, enforce_sorted=False)
+        packed_l = pack_padded_sequence(l_ids, lengths=l_len, batch_first=True, enforce_sorted=False)
+
+        # Pass and return TODO: Pass packed_in & packed_l when Packed Sequence processing works
+        out = model(in_ids, l_ids)
+        prediction = model.generator(out)
+        loss = criterion(prediction.contiguous().view(-1, prediction.size(-1)), l_ids.contiguous().view(-1))
+        return out, loss
+
+
+def start():
+    args, hp = Common.loadParams()
+    model_name = args.model
+    model_postfix = "SMALL" if args.layers > 0 else "PRETRAINED"
+
+    # Initialize Tokenizer
     tokenizer = BracketTokenizer.from_pretrained('facebook/bart-base')  # Use custom tokenizer
+    if model_name == "BART":
+        trainer = TransductionTrainer(hp)
+    elif model_name == "LSTM":
+        trainer = Seq2SeqLSTMTrainer(hp, tokenizer)
+
+    # Load Training Data
+    training_set_name = "Grammar1_7143222753796263824.json" if not args.set_name else args.set_name
     dataset = load_data(Common.training_folder + training_set_name)  # Load data from file
     print("Loaded dataset: " + training_set_name)
 
-    # Initialize weights & biases
+    # Initialize weights & biases for logging
     config = {
-        "model": "BartForConditionalGeneration",
+        "model": "BartForConditionalGeneration" if model_name == "BART" else model_name,
         "optimizer": "AdamW",
         "criterion": "CrossEntropy",
         "training_set": training_set_name,
@@ -212,21 +381,37 @@ def main():
 
         "num_epochs": hp.num_epochs,
         "learning_rate": hp.learning_rate,
-        "gradient_clipping_max": hp.max_norm
+        "gradient_clipping_max": hp.max_norm,
+
+        "num_layers": args.layers
     }
     tags = [
         "TreeBracketing",
-        training_set_name.replace(".json", "")
+        training_set_name.replace(".json", ""),
+        model_name,
+        model_postfix
     ]
-    wandb.init(project="Tree Bracketing", config=config, tags=tags)
+    wandb_mode = 'disabled' if args.test_mode else 'online'
+    wandb.init(project="Tree Bracketing", config=config, tags=tags, mode=wandb_mode)
     wandb.define_metric("loss", summary='min')
     wandb.define_metric("accuracy", summary='max')
 
     # Split and prepare training data
     train_set, test_set = trainer.split_and_prepare(tokenizer, dataset['data'])
+    # train_set = TensorDataset(*train_set[0:int(len(train_set) / 2)])
 
     # Define Model
-    model = BartForConditionalGeneration.from_pretrained('facebook/bart-base')  # BART Decoder-Encoder for Seq2Seq
+    if model_name == "BART":
+        config = BartConfig.from_pretrained('facebook/bart-base')
+        if args.layers > 0:
+            config.num_hidden_layers = args.layers
+        model = BartForConditionalGeneration.from_pretrained('facebook/bart-base',
+                                                             config=config)  # BART Decoder-Encoder for Seq2Seq
+        model.resize_token_embeddings(tokenizer.vocab_size)
+        metrics = TransductionMetrics()
+    else:
+        model = BaseLines.Seq2SeqBiLSTM(vocab_size=tokenizer.vocab_size, input_dim=128, hidden_dim=1024)
+        metrics = LSTMTransductionMetrics(model)
     model.to(device=hp.device)
 
     # Initialize optimizer and criterion
@@ -234,21 +419,23 @@ def main():
     criterion = torch.nn.CrossEntropyLoss()
     criterion.to(hp.device)
 
-    # Initialize Metrics
-    metrics = TransductionMetrics()
-
     # Start training
-    trainer.train(model=model, optimizer=optimizer, criterion=criterion, data_set=train_set, metrics=metrics)
+    trainer.train(model=model, optimizer=optimizer, tokenizer=tokenizer, criterion=criterion, data_set=train_set,
+                  metrics=metrics)
 
     # Evaluate
-    trainer.train(model=model, optimizer=optimizer, criterion=criterion, data_set=test_set, metrics=metrics,
-                  is_training=False)
+    trainer.eval(model=model, optimizer=optimizer, tokenizer=tokenizer, criterion=criterion, data_set=test_set,
+                 metrics=metrics,
+                 split_into_two=False)
+
+    # Task specific evaluation
+    trainer.eval_labels()
 
     # Save Model & Optimizer
-    name = "BRACKETING_" + training_set_name.replace(".json", "") + "_" + str(datetime.datetime.now().timestamp())
+    name = "BRACKETING_" + training_set_name.replace(".json", "") + model_name + "_" + model_postfix
     save(name, model=model, optimizer=optimizer)
 
 
 if __name__ == "__main__":
     print("Starting script...")
-    main()
+    start()
