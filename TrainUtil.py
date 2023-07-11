@@ -122,6 +122,7 @@ class Trainer(ABC):
         num_epochs = self.hp.num_epochs
         data_loader = DataLoader(data_set, batch_size=self.hp.batch_size, shuffle=True, drop_last=True)
         data_set_size = len(data_loader)
+        print_every = self.hp.print_every if self.hp.print_every else int(data_set_size / 100)
 
         print(">> Training Started <<")
         for epoch in range(num_epochs):
@@ -150,10 +151,10 @@ class Trainer(ABC):
                 optimizer.step()
 
                 # print info
-                if (i + 1) % self.hp.print_every == 0 or (i + 1) == data_set_size:
+                if (i + 1) % print_every == 0 or (i + 1) == data_set_size:
                     # for last batch in epoch use residual, else use hp.print_every
-                    count = self.hp.print_every if (i + 1) % self.hp.print_every == 0 \
-                        else data_set_size % self.hp.print_every
+                    count = print_every if (i + 1) % print_every == 0 \
+                        else data_set_size % print_every
 
                     prefix = ""
                     metrics.print(index=i + 1, set_size=data_set_size, prefix=prefix, count=count, epoch=epoch,
@@ -167,9 +168,9 @@ class Trainer(ABC):
 
     def eval(self, model, optimizer, tokenizer, criterion, data_set, metrics: Metrics, split_into_two=False, log_prefix=None):
         device = self.hp.device
-        print_every = int(self.hp.print_every / 3)
         data_loader = DataLoader(data_set, batch_size=self.hp.batch_size, shuffle=False, drop_last=True)
         data_set_size = len(data_loader)
+        print_every = self.hp.print_every if self.hp.print_every else int(data_set_size / 100)
         metrics.reset()
 
         print(">> Evaluation Started <<")

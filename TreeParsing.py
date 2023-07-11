@@ -72,6 +72,7 @@ def start():
         "optimizer": "AdamW",
         "criterion": "CrossEntropy",
         "training_set": training_set_name,
+        "training_set_size": len(dataset['data']),
 
         "batch_size": hp.batch_size,
         "input_size": hp.input_size,
@@ -223,8 +224,7 @@ def calculate_edit_distance_all(labels, predicted):
 
 
 def count_full_hit_percentage(labels, predicted):
-    diff = torch.count_nonzero(labels - predicted, dim=1)
-    non_full_hits = torch.count_nonzero(diff)
+    non_full_hits = torch.count_nonzero(torch.count_nonzero(labels - predicted, dim=1))
     num_full_hits = labels.size(0) - non_full_hits
     return num_full_hits.item() / labels.size(0)
 
@@ -252,16 +252,20 @@ class TransductionMetrics(TrainUtil.Metrics):
             idx = error_indices[random.randrange(len(error_indices))]
             self.errors.append((input_ids[idx], labels[idx], predicted_indices[idx]))
 
-        labels = labels.reshape(-1, 1)
-        predicted_indices = predicted_indices.reshape(-1, 1)
         assert labels.size() == predicted_indices.size(), f"{labels.size()} != {predicted_indices.size()}"
 
-        #  Calculate
+        # Calculate metrics
         avg_length = torch.count_nonzero(in_masks) / in_masks.size(0)
+        full_hit_perc = count_full_hit_percentage(labels=labels, predicted=predicted_indices.reshape(labels.size()))  # full hits
+
+        # flatten
+        labels = labels.reshape(-1, 1)
+        predicted_indices = predicted_indices.reshape(-1, 1)
+
+        # Calculate residual
         acc = accuracy_score(y_true=labels, y_pred=predicted_indices)  # accuracy,
         f1 = f1_score(y_true=labels, y_pred=predicted_indices, average="micro")  # f1
         edit_dist = calculate_edit_distance(labels, predicted_indices)  # levenshtein
-        full_hit_perc = count_full_hit_percentage(labels=labels, predicted=predicted_indices)  # full hits
 
         # Update
         self.metrics += np.array([avg_length, acc, f1, edit_dist, full_hit_perc])
@@ -400,12 +404,15 @@ class LSTMTransductionMetrics(TrainUtil.Metrics):
 
         assert labels.size() == predicted_indices.size(), f"{labels.size()} != {predicted_indices.size()}"
 
+        full_hit_perc = count_full_hit_percentage(labels=labels, predicted=predicted_indices.reshape(labels.size()))  # full hits
+
+
+
         #  Calculate
         avg_length = torch.count_nonzero(in_masks) / in_masks.size(0)
         acc = accuracy_score(y_true=labels, y_pred=predicted_indices)  # accuracy,
         f1 = f1_score(y_true=labels, y_pred=predicted_indices, average="micro")  # f1
         edit_dist = calculate_edit_distance(labels, predicted_indices)  # levenshtein
-        full_hit_perc = count_full_hit_percentage(labels=labels, predicted=predicted_indices)  # full hits
 
         # Update
         self.metrics += np.array([avg_length, acc, f1, edit_dist, full_hit_perc])

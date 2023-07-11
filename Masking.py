@@ -38,7 +38,7 @@ hp.max_norm = 5.0
 
 
 def count_full_hit_percentage(labels, predicted):
-    non_full_hits = torch.count_nonzero(labels - predicted)
+    non_full_hits = torch.count_nonzero(torch.count_nonzero(labels - predicted, dim=1))
     num_full_hits = labels.size(0) - non_full_hits
     return num_full_hits.item() / labels.size(0)
 

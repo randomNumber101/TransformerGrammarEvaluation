@@ -20,7 +20,7 @@ class HyperParams:
         self.max_norm = 1.0  # Used for gradient clipping
 
         # Printing
-        self.print_every = 5
+        self.print_every = None
 
 
 def overwrite_params(hps: HyperParams, overwrite: typing.Dict[str, object]):
