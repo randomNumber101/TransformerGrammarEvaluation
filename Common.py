@@ -56,6 +56,7 @@ def loadParams():
     parser.add_argument('-pe', '--print_every', type=int, help="Frequency of logging results")
     parser.add_argument('-test', '--test_mode', help="Test mode. Deactivated wandb.", action='store_true')
     parser.add_argument('-l', '--layers', type=int, help="Number of layers", default=-1)
+    parser.add_argument('-tok', '--tokenize', type=str, help="Tokenization strategy [bpe, words, words_bpe]", default="bpe")
 
 
     args = parser.parse_args()

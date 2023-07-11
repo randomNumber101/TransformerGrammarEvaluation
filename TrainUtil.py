@@ -35,7 +35,6 @@ def sort_by_length(a, masks, c, d):
     sorted_tensors = (torch.stack(list(map(lambda t: t[i], sorted_tuples))) for i in range(len(sorted_tuples[0])))
     return sorted_tensors
 
-
 class Metrics(ABC):
     @abstractmethod
     def update(self, batch, outputs):

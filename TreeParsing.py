@@ -5,6 +5,7 @@
         ((He))((goes)((to)((the)(mall))))
 """
 import datetime
+import os
 import random
 import re
 from enum import Enum
@@ -39,26 +40,122 @@ hp.max_norm = 5.0
 '''
 
 EPS = 0.05  ## Error EPS
+bracket_pattern = r"\(\w*|\)\w*"
+
+
+def start():
+    args, hp = Common.loadParams()
+    model_name = args.model
+    model_postfix = "SMALL" if args.layers > 0 else "PRETRAINED"
+
+    # Load Training Data
+    training_set_name = "Grammar1_7143222753796263824.json" if not args.set_name else args.set_name
+    dataset = load_data(Common.training_folder + training_set_name)  # Load data from file
+    print("Loaded dataset: " + training_set_name)
+
+    # Initialize Tokenizer
+    if args.tokenize == "words":
+        tokenizer = BracketTokenizer.from_pretrained('facebook/bart-base').word_wise()
+    elif args.tokenize == "words_bpe":
+        tokenizer = BracketTokenizer.from_pretrained('facebook/bart-base')  # Use custom tokenizer
+    else:
+        tokenizer = BartTokenizer.from_pretrained('facebook/bart-base')  # Use default tokenizer
+
+    if model_name == "BART":
+        trainer = TransductionTrainer(hp)
+    elif model_name == "LSTM":
+        trainer = Seq2SeqLSTMTrainer(hp, tokenizer)
+
+    # Initialize weights & biases for logging
+    config = {
+        "model": "BartForConditionalGeneration" if model_name == "BART" else model_name,
+        "optimizer": "AdamW",
+        "criterion": "CrossEntropy",
+        "training_set": training_set_name,
+
+        "batch_size": hp.batch_size,
+        "input_size": hp.input_size,
+        "batch_eval_count": hp.print_every,
+
+        "num_epochs": hp.num_epochs,
+        "learning_rate": hp.learning_rate,
+        "gradient_clipping_max": hp.max_norm,
+
+        "num_layers": args.layers
+    }
+    tags = [
+        "TreeBracketing",
+        training_set_name.replace(".json", ""),
+        model_name,
+        model_postfix
+    ]
+    wandb_mode = 'disabled' if args.test_mode else 'online'
+    wandb.init(project="Tree Bracketing", config=config, tags=tags, mode=wandb_mode)
+    wandb.define_metric("loss", summary='min')
+    wandb.define_metric("accuracy", summary='max')
+
+    # Split and prepare training data
+    train_set, test_set = trainer.split_and_prepare(tokenizer, dataset['data'])
+    # train_set = TensorDataset(*train_set[0:int(len(train_set) / 2)])
+
+    # Define Model
+    if model_name == "BART":
+        config = BartConfig.from_pretrained('facebook/bart-base')
+        if args.layers > 0:
+            config.num_hidden_layers = args.layers
+        model = BartForConditionalGeneration.from_pretrained('facebook/bart-base',
+                                                             config=config)  # BART Decoder-Encoder for Seq2Seq
+        model.resize_token_embeddings(len(tokenizer))
+        metrics = TransductionMetrics()
+    else:
+        model = BaseLines.Seq2SeqBiLSTM(vocab_size=tokenizer.vocab_size, input_dim=128, hidden_dim=1024)
+        metrics = LSTMTransductionMetrics(model)
+    model.to(device=hp.device)
+
+    # Initialize optimizer and criterion
+    optimizer = AdamW(model.parameters(), lr=hp.learning_rate)
+    criterion = torch.nn.CrossEntropyLoss()
+    criterion.to(hp.device)
+
+    # Start training
+    trainer.train(model=model, optimizer=optimizer, tokenizer=tokenizer, criterion=criterion, data_set=train_set,
+                  metrics=metrics)
+
+    # Evaluate
+    trainer.eval(model=model, optimizer=optimizer, tokenizer=tokenizer, criterion=criterion, data_set=test_set,
+                 metrics=metrics,
+                 split_into_two=False)
+
+    # Task specific evaluation
+    # trainer.eval_labels()
+
+    # Save Model & Optimizer
+    name = "BRACKETING_" + training_set_name.replace(".json", "") + model_name + "_" + model_postfix
+    save(name, model=model, optimizer=optimizer)
 
 
 class BracketTokenizer(BartTokenizer):
     def __init__(self, *args, **kwargs):
         super(BracketTokenizer, self).__init__(*args, **kwargs, add_prefix_space=True)
         # Regex: Either open bracket with a type (word), closed bracket or a string not containing brackets or space.
-        self.token_pattern = r"\(\w*|\)|[^()\s]|\s+"
+        self.token_pattern = r"\(\w*|\)|[^()\s]+|\s+"
         self.bracket_ids = {}
         self.next_bracket_id_index = 0
         self.bracket_types = set()
+        self.do_word_wise = False
+        self.grammar_vocab = set()
 
-    # deprecated
-    # returns even number for opening brackets and odd for closing. brackets of same type have succeeding numbers.
-    def depr_get_bracket_id(self, bracket_type, opening):
-        if bracket_type in self.bracket_ids:
-            return self.bracket_ids.get(bracket_type) + int(not opening)
-        else:
-            newId = self.next_bracket_id_index
-            self.next_bracket_id_index += 2
-            return newId + int(not opening)
+    def word_wise(self):
+        self.encoder = {
+            "<s>": 0,
+            "<pad>": 1,
+            "</s>": 2,
+            "<unk>": 3,
+            "<mask>": 4
+        }
+        self.decoder = {}
+        self.do_word_wise = True
+        return self
 
     def get_bracket_token(self, bracket_type, opening):
         t = None
@@ -67,13 +164,13 @@ class BracketTokenizer(BartTokenizer):
         else:
             t = '(' + bracket_type
 
-        #if t not in self.bracket_types:
-        #    self.bracket_types.add(t)
-        #    self.add_tokens(t)
+        if t not in self.bracket_types:
+            self.bracket_types.add(t)
+            self.add_tokens(t)
 
         return t
 
-    def _tokenize(self, text, **kwargs):
+    def tokenize(self, text, **kwargs):
         basicTokens = re.findall(pattern=self.token_pattern, string=text)
         split_tokens = []
         bracket_stack = []
@@ -81,20 +178,43 @@ class BracketTokenizer(BartTokenizer):
             if token.startswith("("):
                 bracket_type = token[1:] if len(token) > 1 else "-NONE-"
                 bracket_stack.append(bracket_type)
-                bracket_token = self.get_bracket_token(bracket_type=bracket_type, opening=True)
-                split_tokens.extend(super(BracketTokenizer, self)._tokenize(bracket_token))
+                token = self.get_bracket_token(bracket_type=bracket_type, opening=True)
             elif token == ')' and bracket_stack:
                 bracket_type = bracket_stack.pop()
-                bracket_token = self.get_bracket_token(bracket_type=bracket_type, opening=False)
-                split_tokens.extend(super(BracketTokenizer, self)._tokenize(bracket_token))
+                token = self.get_bracket_token(bracket_type=bracket_type, opening=False)
+            if self.do_word_wise:
+                if token not in self.grammar_vocab:
+                    self.grammar_vocab.add(token)
+                    self.add_tokens(token)
+                split_tokens.append(token)
             else:
                 split_tokens.extend(super(BracketTokenizer, self)._tokenize(token))
         return split_tokens
+
 
 def calculate_edit_distance(labels, predicted):
     index = random.randrange(labels.size(dim=0))
     return textdistance.levenshtein.distance(labels[index, :].tolist(), predicted[index, :].tolist()) * labels.size(
         dim=0) / labels.size(dim=1)
+
+
+def brackets_only(s: str):
+    return re.findall(bracket_pattern, s)
+
+
+def bracket_edit_distance(label, prediction):
+    return textdistance.levenshtein.distance(brackets_only(label), brackets_only(prediction))
+
+
+def bracket_accuracy(label, prediction):
+    label = brackets_only(label)
+    prediction = brackets_only(prediction)
+
+    if len(prediction) < len(label):
+        for i in range(len(label) - len(prediction)):
+            prediction.append("<pad>")
+    prediction = prediction[0: len(label)]
+    return accuracy_score(label, prediction)
 
 
 def calculate_edit_distance_all(labels, predicted):
@@ -157,6 +277,13 @@ class TransductionMetrics(TrainUtil.Metrics):
         inp, label, pred = (decoder(ids) for ids in error)
         print(f"IN: \n\t{inp} \nOUT: \n\t{pred} \nTRUE: \n\t{label}\n")
 
+        bracket_acc = 0.
+        for error in self.errors:
+            inp, label, pred = (decoder(ids) for ids in error)
+            bracket_acc += bracket_accuracy(label, pred)
+
+        bracket_acc /= len(self.errors)
+
         wandb.log({
             prefix + "in_lengths": avg_length,
             prefix + "epoch": epoch,
@@ -164,7 +291,8 @@ class TransductionMetrics(TrainUtil.Metrics):
             prefix + "accuracy": accuracy,
             prefix + "f1": f1,
             prefix + "levenshtein": levenshtein,
-            prefix + "full_hit%": full_hit_perc
+            prefix + "full_hit%": full_hit_perc,
+            prefix + "bracket_acc": bracket_acc
         })
 
     def reset(self):
@@ -229,11 +357,12 @@ class TransductionTrainer(TrainUtil.Trainer):
         loss = criterion(outputs.logits.reshape(-1, outputs.logits.shape[-1]), l_ids[:, 1:].reshape(-1))
         return outputs.logits, loss
 
-    def eval(self, model, optimizer, tokenizer, criterion, data_set, metrics: TrainUtil.Metrics, split_into_two=False, log_prefix=None):
-        super(TransductionTrainer, self).eval(model, optimizer, tokenizer, criterion, data_set, metrics, split_into_two, log_prefix)
+    def eval(self, model, optimizer, tokenizer, criterion, data_set, metrics: TrainUtil.Metrics, split_into_two=False,
+             log_prefix=None):
+        super(TransductionTrainer, self).eval(model, optimizer, tokenizer, criterion, data_set, metrics, split_into_two,
+                                              log_prefix)
 
         # Model specific evaluation
-
 
 
 class LSTMTransductionMetrics(TrainUtil.Metrics):
@@ -292,6 +421,13 @@ class LSTMTransductionMetrics(TrainUtil.Metrics):
         inp, label, pred = (decoder(ids) for ids in error)
         print(f"IN: \n\t{inp} \nOUT: \n\t{pred} \nTRUE: \n\t{label}\n")
 
+        bracket_acc = 0.
+        for error in self.errors:
+            inp, label, pred = (decoder(ids) for ids in error)
+            bracket_acc += bracket_accuracy(label, pred)
+
+        bracket_acc /= len(self.errors)
+
         wandb.log({
             prefix + "in_lengths": avg_length,
             prefix + "epoch": epoch,
@@ -299,7 +435,8 @@ class LSTMTransductionMetrics(TrainUtil.Metrics):
             prefix + "accuracy": accuracy,
             prefix + "f1": f1,
             prefix + "levenshtein": levenshtein,
-            prefix + "full_hit%": full_hit_perc
+            prefix + "full_hit%": full_hit_perc,
+            prefix + "bracket_acc": bracket_acc
         })
 
     def reset(self):
@@ -349,91 +486,6 @@ class Seq2SeqLSTMTrainer(TransductionTrainer):
         prediction = model.generator(out)
         loss = criterion(prediction.contiguous().view(-1, prediction.size(-1)), l_ids.contiguous().view(-1))
         return out, loss
-
-
-def start():
-    args, hp = Common.loadParams()
-    model_name = args.model
-    model_postfix = "SMALL" if args.layers > 0 else "PRETRAINED"
-
-    # Initialize Tokenizer
-    tokenizer = BracketTokenizer.from_pretrained('facebook/bart-base')  # Use custom tokenizer
-    if model_name == "BART":
-        trainer = TransductionTrainer(hp)
-    elif model_name == "LSTM":
-        trainer = Seq2SeqLSTMTrainer(hp, tokenizer)
-
-    # Load Training Data
-    training_set_name = "Grammar1_7143222753796263824.json" if not args.set_name else args.set_name
-    dataset = load_data(Common.training_folder + training_set_name)  # Load data from file
-    print("Loaded dataset: " + training_set_name)
-
-    # Initialize weights & biases for logging
-    config = {
-        "model": "BartForConditionalGeneration" if model_name == "BART" else model_name,
-        "optimizer": "AdamW",
-        "criterion": "CrossEntropy",
-        "training_set": training_set_name,
-
-        "batch_size": hp.batch_size,
-        "input_size": hp.input_size,
-        "batch_eval_count": hp.print_every,
-
-        "num_epochs": hp.num_epochs,
-        "learning_rate": hp.learning_rate,
-        "gradient_clipping_max": hp.max_norm,
-
-        "num_layers": args.layers
-    }
-    tags = [
-        "TreeBracketing",
-        training_set_name.replace(".json", ""),
-        model_name,
-        model_postfix
-    ]
-    wandb_mode = 'disabled' if args.test_mode else 'online'
-    wandb.init(project="Tree Bracketing", config=config, tags=tags, mode=wandb_mode)
-    wandb.define_metric("loss", summary='min')
-    wandb.define_metric("accuracy", summary='max')
-
-    # Split and prepare training data
-    train_set, test_set = trainer.split_and_prepare(tokenizer, dataset['data'])
-    # train_set = TensorDataset(*train_set[0:int(len(train_set) / 2)])
-
-    # Define Model
-    if model_name == "BART":
-        config = BartConfig.from_pretrained('facebook/bart-base')
-        if args.layers > 0:
-            config.num_hidden_layers = args.layers
-        model = BartForConditionalGeneration.from_pretrained('facebook/bart-base',
-                                                             config=config)  # BART Decoder-Encoder for Seq2Seq
-        model.resize_token_embeddings(tokenizer.vocab_size)
-        metrics = TransductionMetrics()
-    else:
-        model = BaseLines.Seq2SeqBiLSTM(vocab_size=tokenizer.vocab_size, input_dim=128, hidden_dim=1024)
-        metrics = LSTMTransductionMetrics(model)
-    model.to(device=hp.device)
-
-    # Initialize optimizer and criterion
-    optimizer = AdamW(model.parameters(), lr=hp.learning_rate)
-    criterion = torch.nn.CrossEntropyLoss()
-    criterion.to(hp.device)
-
-    # Start training
-    trainer.train(model=model, optimizer=optimizer, tokenizer=tokenizer, criterion=criterion, data_set=train_set,
-                  metrics=metrics)
-
-    # Evaluate
-    trainer.eval(model=model, optimizer=optimizer, tokenizer=tokenizer, criterion=criterion, data_set=test_set,
-                 metrics=metrics,
-                 split_into_two=False)
-
-    # Task specific evaluation
-    trainer.eval_labels()
-
-    # Save Model & Optimizer
-    name = "BRACKETING_" + training_set_name.replace(".json", "") + model_name + "_" + model_postfix
-    save(name, model=model, optimizer=optimizer)
 
 
 if __name__ == "__main__":
