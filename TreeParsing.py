@@ -5,6 +5,7 @@
         ((He))((goes)((to)((the)(mall))))
 """
 import datetime
+import enum
 import os
 import random
 import re
@@ -17,6 +18,7 @@ from sklearn.metrics import accuracy_score, f1_score
 from torch.nn.functional import one_hot
 from torch.nn.utils.rnn import pack_padded_sequence
 from torch.utils.data import TensorDataset
+from transformers.models.bart.modeling_bart import BartLearnedPositionalEmbedding
 
 import BaseLines
 import TrainUtil
@@ -65,6 +67,9 @@ def start():
         trainer = TransductionTrainer(hp)
     elif model_name == "LSTM":
         trainer = Seq2SeqLSTMTrainer(hp, tokenizer)
+    else:
+        print("No such model: " + model_name)
+        return
 
     # Initialize weights & biases for logging
     config = {
@@ -77,6 +82,7 @@ def start():
         "batch_size": hp.batch_size,
         "input_size": hp.input_size,
         "batch_eval_count": hp.print_every,
+        "tokenization": args.tokenize,
 
         "num_epochs": hp.num_epochs,
         "learning_rate": hp.learning_rate,
@@ -88,7 +94,8 @@ def start():
         "TreeBracketing",
         training_set_name.replace(".json", ""),
         model_name,
-        model_postfix
+        model_postfix,
+        args.tokenize
     ]
     wandb_mode = 'disabled' if args.test_mode else 'online'
     wandb.init(project="Tree Bracketing", config=config, tags=tags, mode=wandb_mode)
@@ -109,7 +116,7 @@ def start():
         model.resize_token_embeddings(len(tokenizer))
         metrics = TransductionMetrics()
     else:
-        model = BaseLines.Seq2SeqBiLSTM(vocab_size=tokenizer.vocab_size, input_dim=128, hidden_dim=1024)
+        model = BaseLines.Seq2SeqBiLSTM(vocab_size=len(tokenizer), input_dim=256, hidden_dim=1024)
         metrics = LSTMTransductionMetrics(model)
     model.to(device=hp.device)
 
@@ -131,7 +138,13 @@ def start():
     # trainer.eval_labels()
 
     # Save Model & Optimizer
-    name = "BRACKETING_" + training_set_name.replace(".json", "") + model_name + "_" + model_postfix
+
+    name = "BRACKETING_" + \
+           training_set_name.replace(".json", "") + \
+           model_name + "_" + \
+           model_postfix + \
+           args.tokenize
+
     save(name, model=model, optimizer=optimizer)
 
 
@@ -193,6 +206,24 @@ class BracketTokenizer(BartTokenizer):
         return split_tokens
 
 
+class EmbeddingType(Enum):
+    STANDARD = 0,
+    NONE = 1,
+    POSITIONAL = 0
+
+
+class CustomPositionEmbeddings(BartLearnedPositionalEmbedding):
+    type = EmbeddingType.STANDARD
+
+    def forward(self, input_ids: torch.Tensor, past_key_values_length: int = 0):
+        if type == EmbeddingType.STANDARD:
+            return super().forward(input_ids, past_key_values_length)
+        elif type == EmbeddingType.NONE:
+            return torch.tensor([0])
+        else:
+            raise NotImplementedError("Other positional embedding types haven't been implemented yet.")
+
+
 def calculate_edit_distance(labels, predicted):
     index = random.randrange(labels.size(dim=0))
     return textdistance.levenshtein.distance(labels[index, :].tolist(), predicted[index, :].tolist()) * labels.size(
@@ -235,14 +266,22 @@ class TransductionMetrics(TrainUtil.Metrics):
         super().__init__()
         self.metrics = np.zeros(5)
         self.errors = []
+        self.log_num = 0
+        self.current_prefix = "<init>"
 
-    def update(self, batch, outputs):
-        input_ids, in_masks, labels, _ = (tensor.cpu().detach() for tensor in batch)
+    def prepare_data(self, batch, outputs):
+        input_ids, in_masks, l_ids, l_masks = (tensor.cpu().detach() for tensor in batch)
         outputs = outputs.cpu().detach()
 
         # Adapt
-        labels = labels[:, 1:]
+        l_ids = l_ids[:, 1:]
         predicted_indices = torch.argmax(outputs, dim=-1)
+
+        return input_ids, in_masks, l_ids, l_masks, predicted_indices
+
+    def update(self, batch, outputs):
+
+        input_ids, in_masks, labels, _, predicted_indices = self.prepare_data(batch, outputs)
 
         # Sample one erroneous prediction
         error_indices = torch.nonzero(torch.any(predicted_indices != labels, dim=1)).squeeze().squeeze().tolist()
@@ -256,7 +295,8 @@ class TransductionMetrics(TrainUtil.Metrics):
 
         # Calculate metrics
         avg_length = torch.count_nonzero(in_masks) / in_masks.size(0)
-        full_hit_perc = count_full_hit_percentage(labels=labels, predicted=predicted_indices.reshape(labels.size()))  # full hits
+        full_hit_perc = count_full_hit_percentage(labels=labels,
+                                                  predicted=predicted_indices.reshape(labels.size()))  # full hits
 
         # flatten
         labels = labels.reshape(-1, 1)
@@ -271,6 +311,11 @@ class TransductionMetrics(TrainUtil.Metrics):
         self.metrics += np.array([avg_length, acc, f1, edit_dist, full_hit_perc])
 
     def print(self, index, set_size, prefix, count, epoch, loss, decoder=None):
+
+        if not self.current_prefix == prefix:
+            self.log_num = 0
+            self.current_prefix = prefix
+
         avg_loss = loss / count
         metrics = self.metrics / count
         [avg_length, accuracy, f1, levenshtein, full_hit_perc] = metrics
@@ -296,8 +341,11 @@ class TransductionMetrics(TrainUtil.Metrics):
             prefix + "f1": f1,
             prefix + "levenshtein": levenshtein,
             prefix + "full_hit%": full_hit_perc,
-            prefix + "bracket_acc": bracket_acc
+            prefix + "bracket_acc": bracket_acc,
+            "custom_step": self.log_num
         })
+
+        self.log_num += 1
 
     def reset(self):
         self.metrics = np.zeros(5)
@@ -369,86 +417,24 @@ class TransductionTrainer(TrainUtil.Trainer):
         # Model specific evaluation
 
 
-class LSTMTransductionMetrics(TrainUtil.Metrics):
+class LSTMTransductionMetrics(TransductionMetrics):
     def __init__(self, model):
         super().__init__()
         self.model = model
-        self.metrics = np.zeros(5)
         self.generator = model.generator
         self.errors = []
 
-    def update(self, batch, outputs):
-
-        # input_ids, in_masks, labels, _ = batch
-        # in_masks = in_masks.cpu().detach()
-
+    def prepare_data(self, batch, outputs):
         # Find nearest
         with torch.no_grad():
             predicted_indices = self.generator(outputs)
             predicted_indices = torch.argmax(predicted_indices, dim=-1)
 
         # Move to CPU
-        input_ids, in_masks, labels, _ = (tensor.cpu().detach() for tensor in batch)
+        input_ids, in_masks, labels, l_masks = (tensor.cpu().detach() for tensor in batch)
         predicted_indices = predicted_indices.cpu().detach()
 
-        # Sample one erroneous prediction
-        error_indices = torch.nonzero(torch.any(predicted_indices != labels, dim=1)).squeeze().tolist()
-        if error_indices:
-            if not isinstance(error_indices, list):
-                error_indices = [error_indices]
-            idx = error_indices[random.randrange(len(error_indices))]
-            self.errors.append((input_ids[idx], labels[idx], predicted_indices[idx]))
-
-        labels = labels.reshape(-1, 1)
-        predicted_indices = predicted_indices.reshape(-1, 1)
-
-        assert labels.size() == predicted_indices.size(), f"{labels.size()} != {predicted_indices.size()}"
-
-        full_hit_perc = count_full_hit_percentage(labels=labels, predicted=predicted_indices.reshape(labels.size()))  # full hits
-
-
-
-        #  Calculate
-        avg_length = torch.count_nonzero(in_masks) / in_masks.size(0)
-        acc = accuracy_score(y_true=labels, y_pred=predicted_indices)  # accuracy,
-        f1 = f1_score(y_true=labels, y_pred=predicted_indices, average="micro")  # f1
-        edit_dist = calculate_edit_distance(labels, predicted_indices)  # levenshtein
-
-        # Update
-        self.metrics += np.array([avg_length, acc, f1, edit_dist, full_hit_perc])
-
-    def print(self, index, set_size, prefix, count, epoch, loss, decoder=None):
-        avg_loss = loss / count
-        metrics = self.metrics / count
-        [avg_length, accuracy, f1, levenshtein, full_hit_perc] = metrics
-        print(
-            f"Batch {index}/{set_size} - Loss: {avg_loss:.4f}, Accuracy: {accuracy:.4f}, F1: {f1:.4f}, Lengths: {avg_length:.2f}")
-
-        error = self.errors[random.randrange(len(self.errors))]
-        inp, label, pred = (decoder(ids) for ids in error)
-        print(f"IN: \n\t{inp} \nOUT: \n\t{pred} \nTRUE: \n\t{label}\n")
-
-        bracket_acc = 0.
-        for error in self.errors:
-            inp, label, pred = (decoder(ids) for ids in error)
-            bracket_acc += bracket_accuracy(label, pred)
-
-        bracket_acc /= len(self.errors)
-
-        wandb.log({
-            prefix + "in_lengths": avg_length,
-            prefix + "epoch": epoch,
-            prefix + "loss": avg_loss,
-            prefix + "accuracy": accuracy,
-            prefix + "f1": f1,
-            prefix + "levenshtein": levenshtein,
-            prefix + "full_hit%": full_hit_perc,
-            prefix + "bracket_acc": bracket_acc
-        })
-
-    def reset(self):
-        self.metrics = np.zeros(5)
-        self.errors = []
+        return input_ids, in_masks, labels, l_masks, predicted_indices
 
 
 class Seq2SeqLSTMTrainer(TransductionTrainer):
@@ -467,7 +453,7 @@ class Seq2SeqLSTMTrainer(TransductionTrainer):
         r = super().encode(inputs, labels, tokenizer)
         return r
 
-    def forward_to_model(self, model, criterion, batch):
+    def forward_to_model(self, model: BaseLines.Seq2SeqBiLSTM, criterion, batch):
         in_ids, in_masks, l_ids, l_masks = batch
         pad_id = self.tokenizer.convert_tokens_to_ids(self.tokenizer.pad_token)
         seq_length = in_ids.size(1)
@@ -484,15 +470,11 @@ class Seq2SeqLSTMTrainer(TransductionTrainer):
         in_len = true_lengths(in_ids)
         l_len = true_lengths(l_ids)
 
-        # Create packed
-        packed_in = pack_padded_sequence(in_ids, lengths=in_len, batch_first=True, enforce_sorted=False)
-        packed_l = pack_padded_sequence(l_ids, lengths=l_len, batch_first=True, enforce_sorted=False)
-
-        # Pass and return TODO: Pass packed_in & packed_l when Packed Sequence processing works
-        out = model(in_ids, l_ids)
-        prediction = model.generator(out)
+        # Pass and return
+        states, hidden, pre_out = model(in_ids, in_masks, l_ids, l_masks, in_len, l_len)
+        prediction = model.generator(pre_out)
         loss = criterion(prediction.contiguous().view(-1, prediction.size(-1)), l_ids.contiguous().view(-1))
-        return out, loss
+        return pre_out, loss
 
 
 if __name__ == "__main__":

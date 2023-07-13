@@ -123,6 +123,7 @@ class Trainer(ABC):
         data_loader = DataLoader(data_set, batch_size=self.hp.batch_size, shuffle=True, drop_last=True)
         data_set_size = len(data_loader)
         print_every = self.hp.print_every if self.hp.print_every else int(data_set_size / 100)
+        print_every = max(print_every, 1)
 
         print(">> Training Started <<")
         for epoch in range(num_epochs):
@@ -171,6 +172,7 @@ class Trainer(ABC):
         data_loader = DataLoader(data_set, batch_size=self.hp.batch_size, shuffle=False, drop_last=True)
         data_set_size = len(data_loader)
         print_every = self.hp.print_every if self.hp.print_every else int(data_set_size / 100)
+        print_every = max(print_every, 1)
         metrics.reset()
 
         print(">> Evaluation Started <<")
