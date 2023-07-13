@@ -285,9 +285,8 @@ class TransductionMetrics(TrainUtil.Metrics):
 
         # Sample one erroneous prediction
         error_indices = torch.nonzero(torch.any(predicted_indices != labels, dim=1)).squeeze().squeeze().tolist()
-        if error_indices:
-            if not isinstance(error_indices, list):
-                error_indices = [error_indices]
+        error_indices = [error_indices] if not isinstance(error_indices, list) else error_indices
+        if error_indices and len(error_indices) > 0:
             idx = error_indices[random.randrange(len(error_indices))]
             self.errors.append((input_ids[idx], labels[idx], predicted_indices[idx]))
 
@@ -322,9 +321,10 @@ class TransductionMetrics(TrainUtil.Metrics):
         print(
             f"Batch {index}/{set_size} - Loss: {avg_loss:.4f}, Accuracy: {accuracy:.4f}, F1: {f1:.4f}, Lengths : {avg_length:.2f}")
 
-        error = self.errors[random.randrange(len(self.errors))]
-        inp, label, pred = (decoder(ids) for ids in error)
-        print(f"IN: \n\t{inp} \nOUT: \n\t{pred} \nTRUE: \n\t{label}\n")
+        if len(self.errors) > 0:
+            error = self.errors[random.randrange(len(self.errors))]
+            inp, label, pred = (decoder(ids) for ids in error)
+            print(f"IN: \n\t{inp} \nOUT: \n\t{pred} \nTRUE: \n\t{label}\n")
 
         bracket_acc = 0.
         for error in self.errors:
