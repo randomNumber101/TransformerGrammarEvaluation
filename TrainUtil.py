@@ -67,6 +67,10 @@ class Trainer(ABC):
     def forward_to_model(self, model, criterion, batch):
         pass
 
+    @abstractmethod
+    def generate(self, model, batch):
+        pass
+
     def split_and_prepare(self, tokenizer, data, split_test=False):
         # Sort by sequence length, log lengths
         data.sort(key=(lambda entry: len(entry.get('i'))))  # sort by input length
@@ -167,8 +171,9 @@ class Trainer(ABC):
                     if device == "cuda":
                         torch.cuda.empty_cache()
 
-    def eval(self, model, optimizer, tokenizer, criterion, data_set, metrics: Metrics, split_into_two=False, log_prefix=None):
+    def test(self, model, optimizer, tokenizer, criterion, data_set, metrics: Metrics, split_into_two=False, generate=False, log_prefix=None, pad_output_to=-1):
         device = self.hp.device
+
         data_loader = DataLoader(data_set, batch_size=self.hp.batch_size, shuffle=False, drop_last=True)
         data_set_size = len(data_loader)
         print_every = self.hp.print_every if self.hp.print_every else int(data_set_size / 100)
@@ -187,7 +192,21 @@ class Trainer(ABC):
 
                 # forward
                 optimizer.zero_grad()
-                outputs, loss = self.forward_to_model(model=model, criterion=criterion, batch=batch)
+
+                if generate:
+                    outputs = self.generate(model, batch)
+                    diff = pad_output_to - outputs.size(1)
+                    if pad_output_to > 0 and diff > 0:
+                        bs = outputs.size(0)
+                        pad_token = tokenizer.pad_token_id
+                        pads = torch.full((bs, diff), pad_token, device=outputs.device, dtype=outputs.dtype)
+                        outputs = torch.cat((outputs, pads), dim=1)
+                    elif diff < 0:
+                        outputs = outputs[:, :diff]
+                    outputs = torch.nn.functional.one_hot(outputs, num_classes=len(tokenizer))
+                    loss = torch.tensor(0)
+                else:
+                    outputs, loss = self.forward_to_model(model=model, criterion=criterion, batch=batch)
 
                 # Update metrics
                 total_loss += loss.item()
@@ -203,15 +222,14 @@ class Trainer(ABC):
                             else data_set_size % print_every
 
                     bin_index = 1 if i < (data_set_size / 2) else 2
-                    prefix = "eval_" if not split_into_two else "bin_" + str(bin_index) + "_"
+                    prefix = "eval_" if not split_into_two else "bin_"
                     prefix = prefix if not log_prefix else log_prefix
                     metrics.print(index=i + 1, set_size=data_set_size, prefix=prefix, count=count, epoch=0,
                                   loss=total_loss, decoder=lambda x: self.decode_tokens(tokenizer, x))
-
-
 
 
                     total_loss = 0
                     metrics.reset()
                     if device == "cuda":
                         torch.cuda.empty_cache()
+

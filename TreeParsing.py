@@ -10,7 +10,7 @@ import os
 import random
 import re
 from enum import Enum
-from typing import List, Union
+from typing import List, Union, TypeVar
 
 import textdistance
 import torch
@@ -21,14 +21,15 @@ from torch.utils.data import TensorDataset
 from transformers.models.bart.modeling_bart import BartLearnedPositionalEmbedding
 
 import BaseLines
+import ModelImpl
 import TrainUtil
 import wandb
 import numpy as np
 
-from transformers import BartForConditionalGeneration, BartTokenizer, BartConfig
+from transformers import BartForConditionalGeneration, BartTokenizer, BartConfig, PreTrainedTokenizer
 from torch.optim import AdamW
 
-from BaseLines import TokenEmbedder
+from ModelImpl import TokenEmbedder
 from Common import save
 from DataUtil import load_data
 import Common
@@ -47,7 +48,7 @@ bracket_pattern = r"\(\w*|\)\w*"
 
 def start():
     args, hp = Common.loadParams()
-    model_name = args.model
+    model_name = "BART" if args.model == "TRANSF" else args.model
     model_postfix = "SMALL" if args.layers > 0 else "PRETRAINED"
 
     # Load Training Data
@@ -55,16 +56,21 @@ def start():
     dataset = load_data(Common.training_folder + training_set_name)  # Load data from file
     print("Loaded dataset: " + training_set_name)
 
+    args.tokenize = "words"
     # Initialize Tokenizer
     if args.tokenize == "words":
+        BracketTokenizer = Common.bracket_tokenizer_of(BartTokenizer)
         tokenizer = BracketTokenizer.from_pretrained('facebook/bart-base').word_wise()
     elif args.tokenize == "words_bpe":
+        BracketTokenizer = Common.bracket_tokenizer_of(BartTokenizer)
         tokenizer = BracketTokenizer.from_pretrained('facebook/bart-base')  # Use custom tokenizer
     else:
         tokenizer = BartTokenizer.from_pretrained('facebook/bart-base')  # Use default tokenizer
 
     if model_name == "BART":
         trainer = TransductionTrainer(hp)
+    elif model_name == "SIMPLE":
+        trainer = SimpleTransductionTrainer(hp)
     elif model_name == "LSTM":
         trainer = Seq2SeqLSTMTrainer(hp, tokenizer)
     else:
@@ -87,7 +93,6 @@ def start():
         "num_epochs": hp.num_epochs,
         "learning_rate": hp.learning_rate,
         "gradient_clipping_max": hp.max_norm,
-
         "num_layers": args.layers
     }
     tags = [
@@ -115,9 +120,24 @@ def start():
                                                              config=config)  # BART Decoder-Encoder for Seq2Seq
         model.resize_token_embeddings(len(tokenizer))
         metrics = TransductionMetrics()
+    elif model_name == "SIMPLE":
+        layers = 6 if not args.layers > 0 else args.layers
+        model = BaseLines.SimpleTransformer(vocab_size=len(tokenizer), num_layers=layers)
+        metrics = TransductionMetrics()
     else:
-        model = BaseLines.Seq2SeqBiLSTM(vocab_size=len(tokenizer), input_dim=256, hidden_dim=1024)
-        metrics = LSTMTransductionMetrics(model)
+        model = BaseLines.Seq2SeqBiLSTM(vocab_size=len(tokenizer), input_dim=256, hidden_dim=1024, num_layers=4)
+        metrics = LSTMTransductionMetrics(model, tokenizer)
+
+    if args.load:
+        name = "BRACKETING_" + \
+               training_set_name.replace(".json", "") + \
+               model_name + "_" + \
+               model_postfix + \
+               args.tokenize
+        state_dict = Common.get_state_dict(name)
+        model.load_state_dict(state_dict)
+        print("Loaded model from file: " + name)
+
     model.to(device=hp.device)
 
     # Initialize optimizer and criterion
@@ -125,103 +145,36 @@ def start():
     criterion = torch.nn.CrossEntropyLoss()
     criterion.to(hp.device)
 
+    if args.eval:
+        trainer.test(model=model, optimizer=optimizer, tokenizer=tokenizer, criterion=criterion, data_set=test_set,
+                     metrics=metrics,
+                     split_into_two=False, generate=True, pad_output_to=hp.input_size - 1, log_prefix="EVAL")
+        return
+
     # Start training
     trainer.train(model=model, optimizer=optimizer, tokenizer=tokenizer, criterion=criterion, data_set=train_set,
                   metrics=metrics)
 
     # Evaluate
-    trainer.eval(model=model, optimizer=optimizer, tokenizer=tokenizer, criterion=criterion, data_set=test_set,
+    trainer.test(model=model, optimizer=optimizer, tokenizer=tokenizer, criterion=criterion, data_set=test_set,
                  metrics=metrics,
                  split_into_two=False)
 
     # Task specific evaluation
-    # trainer.eval_labels()
 
     # Save Model & Optimizer
-
     name = "BRACKETING_" + \
            training_set_name.replace(".json", "") + \
            model_name + "_" + \
            model_postfix + \
            args.tokenize
 
-    save(name, model=model, optimizer=optimizer)
+    if not args.load:
+        save(name, model=model, tokenizer=tokenizer)
 
 
-class BracketTokenizer(BartTokenizer):
-    def __init__(self, *args, **kwargs):
-        super(BracketTokenizer, self).__init__(*args, **kwargs, add_prefix_space=True)
-        # Regex: Either open bracket with a type (word), closed bracket or a string not containing brackets or space.
-        self.token_pattern = r"\(\w*|\)|[^()\s]+|\s+"
-        self.bracket_ids = {}
-        self.next_bracket_id_index = 0
-        self.bracket_types = set()
-        self.do_word_wise = False
-        self.grammar_vocab = set()
-
-    def word_wise(self):
-        self.encoder = {
-            "<s>": 0,
-            "<pad>": 1,
-            "</s>": 2,
-            "<unk>": 3,
-            "<mask>": 4
-        }
-        self.decoder = {}
-        self.do_word_wise = True
-        return self
-
-    def get_bracket_token(self, bracket_type, opening):
-        t = None
-        if not opening:
-            t = ')' + bracket_type
-        else:
-            t = '(' + bracket_type
-
-        if t not in self.bracket_types:
-            self.bracket_types.add(t)
-            self.add_tokens(t)
-
-        return t
-
-    def tokenize(self, text, **kwargs):
-        basicTokens = re.findall(pattern=self.token_pattern, string=text)
-        split_tokens = []
-        bracket_stack = []
-        for token in basicTokens:
-            if token.startswith("("):
-                bracket_type = token[1:] if len(token) > 1 else "-NONE-"
-                bracket_stack.append(bracket_type)
-                token = self.get_bracket_token(bracket_type=bracket_type, opening=True)
-            elif token == ')' and bracket_stack:
-                bracket_type = bracket_stack.pop()
-                token = self.get_bracket_token(bracket_type=bracket_type, opening=False)
-            if self.do_word_wise:
-                if token not in self.grammar_vocab:
-                    self.grammar_vocab.add(token)
-                    self.add_tokens(token)
-                split_tokens.append(token)
-            else:
-                split_tokens.extend(super(BracketTokenizer, self)._tokenize(token))
-        return split_tokens
-
-
-class EmbeddingType(Enum):
-    STANDARD = 0,
-    NONE = 1,
-    POSITIONAL = 0
-
-
-class CustomPositionEmbeddings(BartLearnedPositionalEmbedding):
-    type = EmbeddingType.STANDARD
-
-    def forward(self, input_ids: torch.Tensor, past_key_values_length: int = 0):
-        if type == EmbeddingType.STANDARD:
-            return super().forward(input_ids, past_key_values_length)
-        elif type == EmbeddingType.NONE:
-            return torch.tensor([0])
-        else:
-            raise NotImplementedError("Other positional embedding types haven't been implemented yet.")
+def evaluate_model():
+    pass
 
 
 def calculate_edit_distance(labels, predicted):
@@ -276,7 +229,6 @@ class TransductionMetrics(TrainUtil.Metrics):
         # Adapt
         l_ids = l_ids[:, 1:]
         predicted_indices = torch.argmax(outputs, dim=-1)
-
         return input_ids, in_masks, l_ids, l_masks, predicted_indices
 
     def update(self, batch, outputs):
@@ -321,17 +273,17 @@ class TransductionMetrics(TrainUtil.Metrics):
         print(
             f"Batch {index}/{set_size} - Loss: {avg_loss:.4f}, Accuracy: {accuracy:.4f}, F1: {f1:.4f}, Lengths : {avg_length:.2f}")
 
+        bracket_acc = 1.0
         if len(self.errors) > 0:
             error = self.errors[random.randrange(len(self.errors))]
             inp, label, pred = (decoder(ids) for ids in error)
             print(f"IN: \n\t{inp} \nOUT: \n\t{pred} \nTRUE: \n\t{label}\n")
 
-        bracket_acc = 0.
-        for error in self.errors:
-            inp, label, pred = (decoder(ids) for ids in error)
-            bracket_acc += bracket_accuracy(label, pred)
-
-        bracket_acc /= len(self.errors)
+            bracket_acc = 0.
+            for error in self.errors:
+                inp, label, pred = (decoder(ids) for ids in error)
+                bracket_acc += bracket_accuracy(label, pred)
+            bracket_acc /= len(self.errors)
 
         wandb.log({
             prefix + "in_lengths": avg_length,
@@ -353,6 +305,12 @@ class TransductionMetrics(TrainUtil.Metrics):
 
 
 class TransductionTrainer(TrainUtil.Trainer):
+    def generate(self, model: BartForConditionalGeneration, batch):
+        in_ids, in_masks, l_ids, l_masks = batch
+        with torch.no_grad():
+            outputs = model.generate(input_ids=in_ids, max_length=l_ids.size(1) + 2)
+        return outputs
+
     def __init__(self, hp):
         super().__init__(hp)
 
@@ -409,18 +367,22 @@ class TransductionTrainer(TrainUtil.Trainer):
         loss = criterion(outputs.logits.reshape(-1, outputs.logits.shape[-1]), l_ids[:, 1:].reshape(-1))
         return outputs.logits, loss
 
-    def eval(self, model, optimizer, tokenizer, criterion, data_set, metrics: TrainUtil.Metrics, split_into_two=False,
-             log_prefix=None):
-        super(TransductionTrainer, self).eval(model, optimizer, tokenizer, criterion, data_set, metrics, split_into_two,
-                                              log_prefix)
+class SimpleTransductionTrainer(TransductionTrainer):
+    def forward_to_model(self, model: BaseLines.SimpleTransformer, criterion, batch):
+        in_ids, in_masks, l_ids, l_masks = batch
+        outputs = model(in_ids=in_ids, in_masks=in_masks,
+                        l_ids=l_ids[:, :-1].contiguous(),
+                        l_masks=l_masks[:, :-1].contiguous())
 
-        # Model specific evaluation
+        loss = criterion(outputs.reshape(-1, outputs.shape[-1]), l_ids[:, 1:].reshape(-1))
+        return outputs, loss
 
 
 class LSTMTransductionMetrics(TransductionMetrics):
-    def __init__(self, model):
+    def __init__(self, model, tokenizer):
         super().__init__()
         self.model = model
+        self.tokenizer = tokenizer
         self.generator = model.generator
         self.errors = []
 
@@ -434,13 +396,42 @@ class LSTMTransductionMetrics(TransductionMetrics):
         input_ids, in_masks, labels, l_masks = (tensor.cpu().detach() for tensor in batch)
         predicted_indices = predicted_indices.cpu().detach()
 
-        return input_ids, in_masks, labels, l_masks, predicted_indices
+        diff_size = labels.size(1) - 1 - predicted_indices.size(1)
+        if diff_size > 0:
+            pad_id = self.tokenizer.pad_token_id
+            batch_size = labels.size(0)
+            size = torch.Size((batch_size, diff_size))
+            predicted_indices = torch.cat((predicted_indices, torch.full(size, pad_id)), dim=1)
+
+        return input_ids, in_masks, labels[:, 1:], l_masks[:, 1:], predicted_indices
 
 
 class Seq2SeqLSTMTrainer(TransductionTrainer):
     def __init__(self, hp: Common.HyperParams, tokenizer: BartTokenizer):
         super(Seq2SeqLSTMTrainer, self).__init__(hp)
         self.tokenizer = tokenizer
+
+    def generate(self, model: BaseLines.Seq2SeqBiLSTM, batch):
+        in_ids, in_masks, l_ids, l_masks = batch
+        pad_id = self.tokenizer.pad_token_id
+        sos_id = self.tokenizer.bos_token_id
+        eos_id = self.tokenizer.eos_token_id
+        seq_length = in_ids.size(1)
+
+        def num_pad_token(t):
+            return torch.eq(t, pad_id).sum().item()
+
+        def true_lengths(ids):
+            return torch.tensor(
+                [seq_length - num_pad_token(ids[b, :]) for b in range(ids.size(0))]
+            )
+
+        # Calculate Lengths
+        in_len = true_lengths(in_ids)
+        l_len = true_lengths(l_ids)
+        longest_len = torch.max(l_len).item()
+
+        return model.generate(in_ids, in_masks, in_len, longest_len, sos_id=sos_id, eos_id=eos_id)
 
     def decode_tokens(self, tokenizer: BartTokenizer, ids) -> str | list[str]:
         if len(ids.size()) == 1:
@@ -470,10 +461,16 @@ class Seq2SeqLSTMTrainer(TransductionTrainer):
         in_len = true_lengths(in_ids)
         l_len = true_lengths(l_ids)
 
+        max_len = torch.max(l_len).item()
+
         # Pass and return
-        states, hidden, pre_out = model(in_ids, in_masks, l_ids, l_masks, in_len, l_len)
+        states, hidden, pre_out = model(in_ids, in_masks,
+                                        l_ids[:, :-1].contiguous(),
+                                        l_masks[:, :-1].contiguous(),
+                                        in_len, l_len)
         prediction = model.generator(pre_out)
-        loss = criterion(prediction.contiguous().view(-1, prediction.size(-1)), l_ids.contiguous().view(-1))
+        loss = criterion(prediction.contiguous().view(-1, prediction.size(-1)),
+                         l_ids[:, 1: max_len + 1].contiguous().view(-1))
         return pre_out, loss
 
 
