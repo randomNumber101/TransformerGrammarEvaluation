@@ -49,7 +49,7 @@ class TokenEmbedder:
 # from: https://pytorch.org/tutorials/beginner/transformer_tutorial.html
 class PositionalEncoding(nn.Module):
 
-    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 512):
         super().__init__()
         self.dropout = nn.Dropout(p=dropout)
 
@@ -65,7 +65,9 @@ class PositionalEncoding(nn.Module):
         Arguments:
             x: Tensor, shape ``[seq_len, batch_size, embedding_dim]``
         """
+        x = torch.permute(x, (1, 0, 2))
         x = x + self.pe[:x.size(0)]
+        x = torch.permute(x, (1, 0, 2))
         return self.dropout(x)
 
 
@@ -118,7 +120,6 @@ class Decoder(nn.Module):
         self.dropout_layer = nn.Dropout(p=dropout)
         self.pre_output_layer = nn.Linear(hidden_size + 2 * hidden_size + input_size,
                                           hidden_size, bias=False)
-
 
     def forward_step(self, prev_embed, encoder_hidden, src_mask, proj_key, hidden):
         """Perform a single decoder step (1 word)"""
@@ -174,7 +175,8 @@ class Decoder(nn.Module):
         pre_output_vectors = torch.cat(pre_output_vectors, dim=1)
         return decoder_states, hidden, pre_output_vectors  # [B, MAX_N, D]
 
-    def generate(self, encoder_hidden, encoder_final, src_mask, max_len, sos_id, generator, embedder=None, hidden=None, eos_id=None, device="cuda"):
+    def generate(self, encoder_hidden, encoder_final, src_mask, max_len, sos_id, generator, embedder=None, hidden=None,
+                 eos_id=None, device="cuda"):
         # initialize decoder hidden state
         if hidden is None:
             hidden = self.init_hidden(encoder_final)

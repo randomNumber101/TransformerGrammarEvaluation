@@ -24,7 +24,7 @@ import numpy as np
 from sklearn.model_selection import train_test_split
 
 from torch.utils.data import TensorDataset, DataLoader
-from transformers import BertTokenizer, BertForSequenceClassification, BartTokenizer, BertConfig
+from transformers import BertTokenizer, BertForSequenceClassification, BartTokenizer, BertConfig, BertTokenizerFast
 from torch.optim import AdamW
 
 from operator import itemgetter
@@ -60,7 +60,7 @@ def main():
         BracketTokenizer = Common.bracket_tokenizer_of(BertTokenizer)
         tokenizer = BracketTokenizer.from_pretrained('bert-base-uncased')  # Use custom tokenizer
     else:
-        tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')  # Use default tokenizer
+        tokenizer = BertTokenizerFast.from_pretrained('bert-base-uncased')  # Use default tokenizer
 
     # Initialize Trainer
     label_encoder = LabelEncoder()
@@ -68,6 +68,8 @@ def main():
         trainer = ClassificationTrainer(hp, label_encoder=label_encoder)
     elif model_name == "LSTM":
         trainer = LSTMClassificationTrainer(hp, tokenizer, label_encoder)
+    elif model_name == "SIMPLE":
+        trainer = SimpleClassificationTrainer(hp, label_encoder=label_encoder)
     else:
         print("No such model: " + model_name)
         return
@@ -91,19 +93,19 @@ def main():
         "layers": args.layers
     }
     tags = [
-        "Masking",
+        "Classify",
         training_set_name.replace(".json", ""),
         model_name,
         model_postfix,
         args.tokenize
     ]
     wandb_mode = 'disabled' if args.test_mode else 'online'
-    wandb.init(project="Masking", config=config, tags=tags, mode=wandb_mode)
+    wandb.init(project="Classify", config=config, tags=tags, mode=wandb_mode)
     wandb.define_metric("loss", summary='min')
     wandb.define_metric("accuracy", summary='max')
 
     # Split and prepare training data
-    train_set, test_set = trainer.split_and_prepare(tokenizer, dataset['data'])
+    train_set, test_set = trainer.split_and_prepare(tokenizer, dataset['data'], cap_size=args.set_size)
 
     # Define Model
     if model_name == "BERT":
@@ -116,9 +118,18 @@ def main():
                                                               )  # BERT + Linear Layer
         model.resize_token_embeddings(len(tokenizer))
         metrics = ClassificationMetrics(label_encoder)
+
+    elif model_name == "SIMPLE":
+        layers = 3 if args.layers < 0 else args.layers
+        model = BaseLines.SimpleClassifier(len(tokenizer), len(label_encoder.classes_),
+                                           hidden_dim=512,
+                                           num_layers=layers)
+        metrics = ClassificationMetrics(label_encoder)
+
     elif model_name == "LSTM":
         model = BaseLines.BiLSTMClassifier(len(tokenizer), len(label_encoder.classes_), input_dim=256, hidden_dim=1024)
         metrics = ClassificationMetrics(label_encoder)
+
     else:
         raise NotImplementedError("No such model implemented: " + model_name)
     model.to(device=hp.device)
@@ -144,7 +155,8 @@ def main():
            model_postfix + \
            args.tokenize
 
-    save(name, model=model, optimizer=optimizer)
+    save(name, model=model, tokenizer=tokenizer)
+
 
 def count_full_hit_percentage(labels, predicted):
     non_full_hits = torch.count_nonzero(labels - predicted)
@@ -255,7 +267,6 @@ class ClassificationTrainer(TrainUtil.Trainer):
         self.label_encoder = label_encoder
         self.mask_string = mask_string
 
-    # Decode and replace all special tokens except [MASK]
     def update_metrics(self, metrics: TrainUtil.Metrics, batch, outputs):
         metrics.update(batch, outputs.logits)
 
@@ -278,7 +289,7 @@ class ClassificationTrainer(TrainUtil.Trainer):
         return [self.decode_single(tokenizer, ids[i]) for i in
                 range(ids.size(0))]
 
-    def encode(self, inputs, labels, tokenizer: BartTokenizer):
+    def encode(self, inputs, labels, tokenizer):
         mask_token = tokenizer.mask_token
         mask_id = tokenizer.mask_token_id
 
@@ -320,6 +331,17 @@ class ClassificationTrainer(TrainUtil.Trainer):
         in_ids, in_masks, enc_labels, _ = batch
         outputs = model(in_ids, attention_mask=in_masks, labels=enc_labels)
         loss = criterion(outputs.logits, enc_labels)
+        return outputs, loss
+
+
+class SimpleClassificationTrainer(ClassificationTrainer):
+
+    def update_metrics(self, metrics: TrainUtil.Metrics, batch, outputs):
+        metrics.update(batch, outputs)
+    def forward_to_model(self, model: BaseLines.SimpleClassifier, criterion, batch):
+        in_ids, in_masks, enc_labels, _ = batch
+        outputs = model.forward(in_ids, in_masks)
+        loss = criterion(outputs, enc_labels)
         return outputs, loss
 
 

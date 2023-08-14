@@ -71,10 +71,14 @@ class Trainer(ABC):
     def generate(self, model, batch):
         pass
 
-    def split_and_prepare(self, tokenizer, data, split_test=False):
+    def split_and_prepare(self, tokenizer, data, split_test=False, cap_size=-1):
         # Sort by sequence length, log lengths
-        data.sort(key=(lambda entry: len(entry.get('i'))))  # sort by input length
         set_size = len(data)
+        if not cap_size >= set_size and cap_size != -1:
+            data = random.sample(data, cap_size)
+            set_size = len(data)
+        data.sort(key=(lambda entry: len(entry.get('i'))))  # sort by input length
+
 
         # Log data metrics
         print(f"Dataset size: {len(data)}")
@@ -126,7 +130,7 @@ class Trainer(ABC):
         num_epochs = self.hp.num_epochs
         data_loader = DataLoader(data_set, batch_size=self.hp.batch_size, shuffle=True, drop_last=True)
         data_set_size = len(data_loader)
-        print_every = self.hp.print_every if self.hp.print_every else int(data_set_size / 100)
+        print_every = self.hp.print_every if self.hp.print_every else int(data_set_size / 10)
         print_every = max(print_every, 1)
 
         print(">> Training Started <<")

@@ -15,6 +15,7 @@ from typing import List, Union, TypeVar
 import textdistance
 import torch
 from sklearn.metrics import accuracy_score, f1_score
+from torch.nn import CrossEntropyLoss
 from torch.nn.functional import one_hot
 from torch.nn.utils.rnn import pack_padded_sequence
 from torch.utils.data import TensorDataset
@@ -26,7 +27,7 @@ import TrainUtil
 import wandb
 import numpy as np
 
-from transformers import BartForConditionalGeneration, BartTokenizer, BartConfig, PreTrainedTokenizer
+from transformers import BartForConditionalGeneration, BartTokenizer, BartConfig, PreTrainedTokenizer, BartTokenizerFast
 from torch.optim import AdamW
 
 from ModelImpl import TokenEmbedder
@@ -56,7 +57,6 @@ def start():
     dataset = load_data(Common.training_folder + training_set_name)  # Load data from file
     print("Loaded dataset: " + training_set_name)
 
-    args.tokenize = "words"
     # Initialize Tokenizer
     if args.tokenize == "words":
         BracketTokenizer = Common.bracket_tokenizer_of(BartTokenizer)
@@ -65,11 +65,11 @@ def start():
         BracketTokenizer = Common.bracket_tokenizer_of(BartTokenizer)
         tokenizer = BracketTokenizer.from_pretrained('facebook/bart-base')  # Use custom tokenizer
     else:
-        tokenizer = BartTokenizer.from_pretrained('facebook/bart-base')  # Use default tokenizer
+        tokenizer = BartTokenizerFast.from_pretrained('facebook/bart-base')  # Use default tokenizer
 
     if model_name == "BART":
         trainer = TransductionTrainer(hp)
-    elif model_name == "SIMPLE":
+    elif model_name == "SIMPLE" or model_name == "SIMPLE_BI":
         trainer = SimpleTransductionTrainer(hp)
     elif model_name == "LSTM":
         trainer = Seq2SeqLSTMTrainer(hp, tokenizer)
@@ -108,7 +108,7 @@ def start():
     wandb.define_metric("accuracy", summary='max')
 
     # Split and prepare training data
-    train_set, test_set = trainer.split_and_prepare(tokenizer, dataset['data'])
+    train_set, test_set = trainer.split_and_prepare(tokenizer, dataset['data'], cap_size=args.set_size)
     # train_set = TensorDataset(*train_set[0:int(len(train_set) / 2)])
 
     # Define Model
@@ -120,13 +120,21 @@ def start():
                                                              config=config)  # BART Decoder-Encoder for Seq2Seq
         model.resize_token_embeddings(len(tokenizer))
         metrics = TransductionMetrics()
-    elif model_name == "SIMPLE":
-        layers = 6 if not args.layers > 0 else args.layers
-        model = BaseLines.SimpleTransformer(vocab_size=len(tokenizer), num_layers=layers)
+    elif model_name == "SIMPLE" or model_name == "SIMPLE_BI":
+        layers = 3 if not args.layers > 0 else args.layers
+        is_bidirectional = model_name == "SIMPLE_BI"
+        model = BaseLines.SimpleTransformer(vocab_size=len(tokenizer), num_layers=layers,
+                                            ntokens=hp.input_size,
+                                            bidirectional=is_bidirectional)
         metrics = TransductionMetrics()
     else:
-        model = BaseLines.Seq2SeqBiLSTM(vocab_size=len(tokenizer), input_dim=256, hidden_dim=1024, num_layers=4)
+        model = BaseLines.Seq2SeqBiLSTM(vocab_size=len(tokenizer), input_dim=256, hidden_dim=1024, num_layers=1)
         metrics = LSTMTransductionMetrics(model, tokenizer)
+
+    # Initialize optimizer and criterion
+    optimizer = AdamW(model.parameters(), lr=hp.learning_rate)
+    criterion = torch.nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+    criterion.to(hp.device)
 
     if args.load:
         name = "BRACKETING_" + \
@@ -134,16 +142,19 @@ def start():
                model_name + "_" + \
                model_postfix + \
                args.tokenize
-        state_dict = Common.get_state_dict(name)
-        model.load_state_dict(state_dict)
-        print("Loaded model from file: " + name)
+        try:
+            state_dict = Common.get_state_dict(name)
+            model.load_state_dict(state_dict, strict=False)
+            print("Loaded model from file: " + name)
+            optimizer.load_state_dict(Common.get_optimizer_dict(name))
+            print("Loaded optimizer from file: " + name)
+        except Exception as err:
+            print("Error occurred. Building new optimizer/model instead: " + name)
+            print("Error: " + str(err))
 
     model.to(device=hp.device)
 
-    # Initialize optimizer and criterion
-    optimizer = AdamW(model.parameters(), lr=hp.learning_rate)
-    criterion = torch.nn.CrossEntropyLoss()
-    criterion.to(hp.device)
+
 
     if args.eval:
         trainer.test(model=model, optimizer=optimizer, tokenizer=tokenizer, criterion=criterion, data_set=test_set,
@@ -228,12 +239,13 @@ class TransductionMetrics(TrainUtil.Metrics):
 
         # Adapt
         l_ids = l_ids[:, 1:]
+        l_masks = l_masks[:, 1:]
         predicted_indices = torch.argmax(outputs, dim=-1)
         return input_ids, in_masks, l_ids, l_masks, predicted_indices
 
     def update(self, batch, outputs):
 
-        input_ids, in_masks, labels, _, predicted_indices = self.prepare_data(batch, outputs)
+        input_ids, in_masks, labels, l_masks, predicted_indices = self.prepare_data(batch, outputs)
 
         # Sample one erroneous prediction
         error_indices = torch.nonzero(torch.any(predicted_indices != labels, dim=1)).squeeze().squeeze().tolist()
@@ -249,7 +261,11 @@ class TransductionMetrics(TrainUtil.Metrics):
         full_hit_perc = count_full_hit_percentage(labels=labels,
                                                   predicted=predicted_indices.reshape(labels.size()))  # full hits
 
-        # flatten
+        # mask and flatten
+        mask = l_masks.reshape(-1)
+        labels = labels.reshape(-1).masked_select(mask == 1)
+        predicted_indices = predicted_indices.reshape(-1).masked_select(mask == 1)
+
         labels = labels.reshape(-1, 1)
         predicted_indices = predicted_indices.reshape(-1, 1)
 
@@ -316,8 +332,8 @@ class TransductionTrainer(TrainUtil.Trainer):
 
     def decode_tokens(self, tokenizer: BartTokenizer, ids) -> str | list[str]:
         if len(ids.size()) == 1:
-            return tokenizer.decode(ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
-        return [tokenizer.decode(ids[i], skip_special_tokens=True, clean_up_tokenization_spaces=True) for i in
+            return tokenizer.decode(ids, skip_special_tokens=False, clean_up_tokenization_spaces=True)
+        return [tokenizer.decode(ids[i], skip_special_tokens=False, clean_up_tokenization_spaces=True) for i in
                 range(ids.size(0))]
 
     def encode(self, inputs, labels, tokenizer):
@@ -367,15 +383,17 @@ class TransductionTrainer(TrainUtil.Trainer):
         loss = criterion(outputs.logits.reshape(-1, outputs.logits.shape[-1]), l_ids[:, 1:].reshape(-1))
         return outputs.logits, loss
 
+
 class SimpleTransductionTrainer(TransductionTrainer):
-    def forward_to_model(self, model: BaseLines.SimpleTransformer, criterion, batch):
+    def forward_to_model(self, model: BaseLines.SimpleTransformer, criterion: CrossEntropyLoss, batch):
         in_ids, in_masks, l_ids, l_masks = batch
         outputs = model(in_ids=in_ids, in_masks=in_masks,
                         l_ids=l_ids[:, :-1].contiguous(),
                         l_masks=l_masks[:, :-1].contiguous())
 
         loss = criterion(outputs.reshape(-1, outputs.shape[-1]), l_ids[:, 1:].reshape(-1))
-        return outputs, loss
+        #loss_masked = loss.masked_select(l_masks[:, 1:].reshape(-1) == 1)  # Only compute loss for non-special tokens
+        return outputs, loss #loss_masked.mean()
 
 
 class LSTMTransductionMetrics(TransductionMetrics):
@@ -435,8 +453,8 @@ class Seq2SeqLSTMTrainer(TransductionTrainer):
 
     def decode_tokens(self, tokenizer: BartTokenizer, ids) -> str | list[str]:
         if len(ids.size()) == 1:
-            return tokenizer.decode(ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
-        return [tokenizer.decode(ids[i], skip_special_tokens=True, clean_up_tokenization_spaces=True) for i in
+            return tokenizer.decode(ids, skip_special_tokens=False, clean_up_tokenization_spaces=True)
+        return [tokenizer.decode(ids[i], skip_special_tokens=False, clean_up_tokenization_spaces=True) for i in
                 range(ids.size(0))]
 
     def encode(self, inputs, labels, tokenizer):
@@ -459,7 +477,7 @@ class Seq2SeqLSTMTrainer(TransductionTrainer):
 
         # Calculate Lengths
         in_len = true_lengths(in_ids)
-        l_len = true_lengths(l_ids)
+        l_len = true_lengths(l_ids) - 1  # subtract one as decoder inputs will be shifted by one
 
         max_len = torch.max(l_len).item()
 

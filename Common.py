@@ -3,7 +3,7 @@ import os
 import re
 import typing
 import torch
-from transformers import PreTrainedTokenizer, BertTokenizer, BartTokenizer
+from transformers import PreTrainedTokenizer, BertTokenizer, BartTokenizer, BartTokenizerFast
 
 dirname = os.path.dirname(__file__)
 training_folder = os.path.join(dirname, ".." + os.sep + "data" + os.sep)
@@ -18,7 +18,7 @@ class HyperParams:
         self.input_size = -1
         self.num_epochs = 5
 
-        self.learning_rate = 1e-5
+        self.learning_rate = 1e-4
         self.max_norm = 1.0  # Used for gradient clipping
 
         # Printing
@@ -62,6 +62,7 @@ def loadParams():
                         default="bpe")
     parser.add_argument('-eval', '--eval', help="Evaluation mode. Supply dataset.", action='store_true')
     parser.add_argument("-load", '--load', help="Loads models from pth file.", action='store_true')
+    parser.add_argument('-ds', '--set_size', type=int, help="How much of the dataset to load. Default: -1.", default=-1)
 
     args = parser.parse_args()
 
@@ -145,9 +146,10 @@ def bracket_tokenizer_of(SupClass: ModelTokenizer):
     return BracketTokenizer
 
 
-def save(name, model, tokenizer: PreTrainedTokenizer):
+def save(name, model, tokenizer: PreTrainedTokenizer, optimizer=None):
     torch.save({
-        'model': model.state_dict()
+        'model': model.state_dict(),
+        'optimizer': optimizer.state_dict() if optimizer is not None else {}
     }, os.path.join(result_folder, name + ".pth"))
     tokenizer.save_pretrained(result_folder)
     print("Saved model and tokenizer to " + result_folder + " with name: " + name + ".")
@@ -157,3 +159,8 @@ def get_state_dict(file):
     path = os.path.join(result_folder, file + ".pth")
     model_dict = torch.load(path)
     return model_dict['model']
+
+def get_optimizer_dict(file):
+    path = os.path.join(result_folder, file + ".pth")
+    model_dict = torch.load(path)
+    return model_dict['optimizer']

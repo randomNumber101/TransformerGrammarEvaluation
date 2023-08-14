@@ -1,3 +1,4 @@
+import math
 from typing import Optional
 
 import numpy as np
@@ -5,28 +6,21 @@ import torch
 import torch.nn as nn
 from torch import nn as nn
 from torch.nn import Transformer
+from transformers.models.bart.modeling_bart import BartClassificationHead
 
 from ModelImpl import LegacySeq2SeqBiLSTM, BahdanauAttention, Encoder, Decoder, Generator, AttentionClassificationHead, \
     PositionalEncoding
 
-
-# Refer to: https://pytorch.org/tutorials/beginner/translation_transformer.html
-def generate_square_subsequent_mask(sz, DEVICE):
-    mask = (torch.triu(torch.ones((sz, sz), device=DEVICE)) == 1).transpose(0, 1)
-    mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
-    return mask
-
-
-# Refer to: https://pytorch.org/tutorials/beginner/translation_transformer.html
+from transformers import BartForSequenceClassification
 
 
 class SimpleTransformer(nn.Module):
-    def __init__(self, vocab_size: int, d_model=512, num_layers=6, bidirectional=False, device="cpu"):
+    def __init__(self, vocab_size: int, ntokens=512, d_model=512, num_layers=3, bidirectional=False, device="cpu"):
         super().__init__()
         self.d_model = d_model
         self.src_embed = nn.Embedding(vocab_size, self.d_model)
         self.tgt_embed = nn.Embedding(vocab_size, self.d_model)
-        self.positional_encoder = PositionalEncoding(d_model=self.d_model)
+        self.positional_encoder = PositionalEncoding(d_model=self.d_model, max_len=ntokens)
         self.model = Transformer(d_model=self.d_model, batch_first=True, num_encoder_layers=num_layers,
                                  num_decoder_layers=num_layers)
         self.bidirectional = bidirectional
@@ -34,10 +28,10 @@ class SimpleTransformer(nn.Module):
         self.device = device
 
     def forward(self, in_ids, l_ids, in_masks, l_masks):
-        in_ids = self.src_embed(in_ids)
+        in_ids = self.src_embed(in_ids.long()) * math.sqrt(self.d_model)  # scale by sqrt of dmodel
         in_ids = self.positional_encoder(in_ids)
 
-        l_ids = self.tgt_embed(l_ids)
+        l_ids = self.tgt_embed(l_ids.long()) * math.sqrt(self.d_model)
         l_ids = self.positional_encoder(l_ids)
 
         # Create Masks
@@ -62,13 +56,44 @@ class SimpleTransformer(nn.Module):
         self.device = device
 
 
+class SimpleClassifier(nn.Module):
+
+    def __init__(self, vocab_size, num_classes, hidden_dim=512, num_layers=3, dropout=0.1,
+                 ntoken=512, device="cpu", nhead=8):
+        super(SimpleClassifier, self).__init__()
+        self.pos_encoder = PositionalEncoding(d_model=hidden_dim, max_len=ntoken)
+        self.embedding = nn.Embedding(vocab_size, hidden_dim)
+        self.encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=nhead,
+            batch_first=True
+        )
+        self.encoder = nn.TransformerEncoder(
+            self.encoder_layer,
+            num_layers=num_layers
+        )
+        self.classify = BartClassificationHead(hidden_dim, hidden_dim, num_classes, dropout)
+        self.device = device
+
+    def forward(self, input_ids, mask):
+
+        mask = mask == 0.0
+
+        x = self.embedding(input_ids)
+        x = self.pos_encoder(x)
+        x = self.encoder(x, src_key_padding_mask=mask)
+        x = torch.mean(x, dim=1)
+        x = self.classify(x)
+        return torch.softmax(x, dim=-1)
+
+
 class Seq2SeqBiLSTM(nn.Module):
     """
     A standard Encoder-Decoder architecture. Base for this and many
     other models.
     """
 
-    def __init__(self, vocab_size, input_dim=256, hidden_dim=1024, num_layers=4, dropout=0.2, device="cpu"):
+    def __init__(self, vocab_size, input_dim=256, hidden_dim=1024, num_layers=1, dropout=0.2, device="cpu"):
         super(Seq2SeqBiLSTM, self).__init__()
         self.attention = BahdanauAttention(hidden_dim)
         self.src_embed = nn.Embedding(vocab_size, input_dim)
