@@ -285,7 +285,8 @@ class Generator(nn.Module):
         self.proj = nn.Linear(hidden_size, vocab_size, bias=False)
 
     def forward(self, x):
-        return F.softmax(self.proj(x), dim=-1)
+        # return F.softmax(self.proj(x), dim=-1)
+        return self.proj(x)
 
 
 class AvgClassificationHead(nn.Module):

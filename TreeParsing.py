@@ -4,22 +4,13 @@
     Out:
         ((He))((goes)((to)((the)(mall))))
 """
-import datetime
-import enum
-import os
 import random
 import re
-from enum import Enum
-from typing import List, Union, TypeVar
 
 import textdistance
 import torch
 from sklearn.metrics import accuracy_score, f1_score
 from torch.nn import CrossEntropyLoss
-from torch.nn.functional import one_hot
-from torch.nn.utils.rnn import pack_padded_sequence
-from torch.utils.data import TensorDataset
-from transformers.models.bart.modeling_bart import BartLearnedPositionalEmbedding
 
 import BaseLines
 import ModelImpl
@@ -35,13 +26,6 @@ from Common import save
 from DataUtil import load_data
 import Common
 
-'''
-hp.num_epochs = 5
-hp.batch_size = 32
-hp.print_every = 10
-hp.max_length = -1
-hp.max_norm = 5.0
-'''
 
 EPS = 0.05  ## Error EPS
 bracket_pattern = r"\(\w*|\)\w*"
@@ -58,14 +42,26 @@ def start():
     print("Loaded dataset: " + training_set_name)
 
     # Initialize Tokenizer
+    save_tokenizer = False
+    word_wise = False
     if args.tokenize == "words":
-        BracketTokenizer = Common.bracket_tokenizer_of(BartTokenizer)
-        tokenizer = BracketTokenizer.from_pretrained('facebook/bart-base').word_wise()
-    elif args.tokenize == "words_bpe":
-        BracketTokenizer = Common.bracket_tokenizer_of(BartTokenizer)
-        tokenizer = BracketTokenizer.from_pretrained('facebook/bart-base')  # Use custom tokenizer
+        TokenizerClass = Common.bracket_tokenizer_of(BartTokenizer)
+        word_wise = True
+    elif args.tokenize == "bracket_bpe":
+        TokenizerClass = Common.bracket_tokenizer_of(BartTokenizer)
     else:
-        tokenizer = BartTokenizerFast.from_pretrained('facebook/bart-base')  # Use default tokenizer
+        TokenizerClass = BartTokenizerFast
+
+    tokenizer = Common.load_tokenizer(TokenizerClass, training_set_name, word_wise=word_wise)
+    tokenizer_name = Common.get_tokenizer_name(training_set_name, word_wise)
+    if not tokenizer:
+        tokenizer = TokenizerClass.from_pretrained('facebook/bart-base')  # Use default tokenizer
+        if word_wise:
+            tokenizer = tokenizer.word_wise()
+        save_tokenizer = True
+        print(f"No saved tokenizer with name {tokenizer_name} has been found in local directory {Common.tokenizer_folder}. A new tokenizer will be trained.")
+    else:
+        print(f"Successfully loaded tokenizer {tokenizer_name} from local files.")
 
     if model_name == "BART":
         trainer = TransductionTrainer(hp)
@@ -108,8 +104,15 @@ def start():
     wandb.define_metric("accuracy", summary='max')
 
     # Split and prepare training data
-    train_set, test_set = trainer.split_and_prepare(tokenizer, dataset['data'], cap_size=args.set_size)
-    # train_set = TensorDataset(*train_set[0:int(len(train_set) / 2)])
+    train_set, test_set = trainer.split_and_prepare(tokenizer, dataset['data'], tokenizer_name, cap_size=args.set_size,
+                                                    sort_by_bracket_depth=args.bracket_depth)
+    if save_tokenizer and not args.tokenize == "words_bpe":
+        Common.save_tokenizer(tokenizer, training_set_name, word_wise)
+
+    print("Preprocessing done.")
+    if args.preprocess_only:
+        return
+
 
     # Define Model
     if model_name == "BART":
@@ -120,19 +123,25 @@ def start():
                                                              config=config)  # BART Decoder-Encoder for Seq2Seq
         model.resize_token_embeddings(len(tokenizer))
         metrics = TransductionMetrics()
+        optimizer = AdamW(model.parameters(), lr=hp.learning_rate, betas=(0.9, 0.98))
+        optimizer = TrainUtil.NoamOptim(optimizer, config.d_model) # Use sqrt lr scheduler
+
     elif model_name == "SIMPLE" or model_name == "SIMPLE_BI":
-        layers = 3 if not args.layers > 0 else args.layers
+        layers = 6 if not args.layers > 0 else args.layers
         is_bidirectional = model_name == "SIMPLE_BI"
         model = BaseLines.SimpleTransformer(vocab_size=len(tokenizer), num_layers=layers,
                                             ntokens=hp.input_size,
                                             bidirectional=is_bidirectional)
         metrics = TransductionMetrics()
+        optimizer = AdamW(model.parameters(), lr=hp.learning_rate, betas=(0.9, 0.98))
+        optimizer = TrainUtil.NoamOptim(optimizer, model.d_model)  # Use sqrt lr scheduler
     else:
         model = BaseLines.Seq2SeqBiLSTM(vocab_size=len(tokenizer), input_dim=256, hidden_dim=1024, num_layers=1)
         metrics = LSTMTransductionMetrics(model, tokenizer)
+        optimizer = AdamW(model.parameters(), lr=hp.learning_rate, betas=(0.9, 0.98))
+        optimizer = TrainUtil.NoamOptim(optimizer, model.d_model)
 
-    # Initialize optimizer and criterion
-    optimizer = AdamW(model.parameters(), lr=hp.learning_rate)
+    # Initialize criterion
     criterion = torch.nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
     criterion.to(hp.device)
 
@@ -373,7 +382,7 @@ class TransductionTrainer(TrainUtil.Trainer):
 
         return in_ids, in_masks, l_ids, l_masks
 
-    def forward_to_model(self, model, criterion, batch):
+    def forward_to_model(self, model: BartForConditionalGeneration, criterion, batch):
         in_ids, in_masks, l_ids, l_masks = batch
         outputs = model(input_ids=in_ids, attention_mask=in_masks,
                         decoder_input_ids=l_ids[:, :-1].contiguous(),

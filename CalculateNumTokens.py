@@ -42,193 +42,103 @@ hp.max_length = -1
 hp.max_norm = 5.0
 '''
 
+set_names = [
+    "1D-Mask_420.json",
+    "2D-Mask_420.json",
+    "SF-Mask_420.json",
+    "NSF-Mask_420.json",
+    "LARGE-MASKING_420.json",
+]
+
+tokenization_names = [
+    "bpe",
+    "words"
+]
 
 def main():
-    args, hp = Common.loadParams()
-    model_name = "BERT" if args.model == "TRANSF" else args.model
-    model_postfix = "SMALL" if args.layers > 0 else "PRETRAINED"
+    for tokenization_name in tokenization_names:
+        for training_set_name in set_names:
+            args, hp = Common.loadParams()
+            model_name = "BERT" if args.model == "TRANSF" else args.model
+            model_postfix = "SMALL" if args.layers > 0 else "PRETRAINED"
 
-    # Load Training Data and Tokenizer
-    training_set_name = "Grammar1_7143222753796263824.json" if not args.set_name else args.set_name
-    dataset = load_data(Common.training_folder + training_set_name)  # Load data from file
-    print("Loaded dataset: " + training_set_name)
+            # Load Training Data and Tokenizer
+            dataset = load_data(Common.training_folder + training_set_name)  # Load data from file
+            print("Loaded dataset: " + training_set_name)
 
-    #
-    #  Initialize Tokenizer & Label Encoder
-    #
+            # Initialize Tokenizer
+            if model_name != "BART":
+                if tokenization_name == "words":
+                    BracketTokenizer = Common.bracket_tokenizer_of(BertTokenizer)
+                    tokenizer = BracketTokenizer.from_pretrained('bert-base-uncased').word_wise()
+                elif tokenization_name == "words_bpe":
+                    BracketTokenizer = Common.bracket_tokenizer_of(BertTokenizer)
+                    tokenizer = BracketTokenizer.from_pretrained('bert-base-uncased')  # Use custom tokenizer
+                else:
+                    tokenizer = BertTokenizerFast.from_pretrained('bert-base-uncased')  # Use default tokenizer
+            else:
+                if tokenization_name == "words":
+                    BracketTokenizer = Common.bracket_tokenizer_of(BartTokenizer)
+                    tokenizer = BracketTokenizer.from_pretrained('facebook/bart-base').word_wise()
+                elif tokenization_name == "words_bpe":
+                    BracketTokenizer = Common.bracket_tokenizer_of(BartTokenizer)
+                    tokenizer = BracketTokenizer.from_pretrained('facebook/bart-base')  # Use custom tokenizer
+                else:
+                    tokenizer = BartTokenizerFast.from_pretrained('facebook/bart-base')  # Use default tokenizer
 
-    word_wise = False
-    model_url = None
-    TokenizerClass = None
-    save_tokenizer = False
+            # Initialize Trainer
+            label_encoder = LabelEncoder()
+            if model_name == "BERT" or model_name == "BART":
+                trainer = ClassificationTrainer(hp, label_encoder=label_encoder)
+            elif model_name == "LSTM":
+                trainer = LSTMClassificationTrainer(hp, tokenizer, label_encoder)
+            elif model_name == "SIMPLE":
+                trainer = SimpleClassificationTrainer(hp, label_encoder=label_encoder)
+            else:
+                print("No such model: " + model_name)
+                return
 
-    if model_name != "BART":
-        model_url = 'bert-base-uncased'
-        if args.tokenize == "words":
-            TokenizerClass = Common.bracket_tokenizer_of(BertTokenizer)
-            word_wise = True
-        elif args.tokenize == "words_bpe":
-            TokenizerClass = Common.bracket_tokenizer_of(BertTokenizer)
-        else:
-            TokenizerClass = BertTokenizerFast
-    else:
-        model_url = 'facebook/bart-base'
-        if args.tokenize == "words":
-            TokenizerClass = Common.bracket_tokenizer_of(BartTokenizer)
-            word_wise = True
-        elif args.tokenize == "words_bpe":
-            TokenizerClass = Common.bracket_tokenizer_of(BartTokenizer)
-        else:
-            TokenizerClass = BartTokenizerFast
+            # Initialize weights & biases
+            config = {
+                "model": model_name,
+                "optimizer": "AdamW",
+                "criterion": "CrossEntropy",
+                "training_set": training_set_name,
 
-    tokenizer_name = Common.get_tokenizer_name(training_set_name, word_wise)
-    tokenizer = Common.load_tokenizer(TokenizerClass, training_set_name, word_wise=False)
-    if not tokenizer:
-        tokenizer = TokenizerClass.from_pretrained(model_url)  # Use default tokenizer
-        if word_wise:
-            tokenizer = tokenizer.word_wise()
-        save_tokenizer = True
-        print(
-            f"No saved tokenizer with name {tokenizer_name} has been found in local directory {Common.tokenizer_folder}. A new tokenizer will be trained.")
-    else:
-        print(f"Successfully loaded tokenizer {tokenizer_name} from local files.")
+                "batch_size": hp.batch_size,
+                "input_size": hp.input_size,
+                "batch_eval_count": hp.print_every,
 
-    save_label_encoder = False
-    label_encoder = Common.load_label_encoder(tokenizer_name)
-    if not label_encoder:
-        print(f"No saved label encoder in {tokenizer_name} has been found. Training new one.")
-        label_encoder = LabelEncoder()
-        save_label_encoder = True
-    else:
-        print(f"Successfully loaded label encoder in {tokenizer_name}.")
+                "num_epochs": hp.num_epochs,
+                "learning_rate": hp.learning_rate,
+                "gradient_clipping_max": hp.max_norm,
+
+                "tokenization": tokenization_name,
+                "layers": args.layers
+            }
+            tags = [
+                "Classify",
+                training_set_name.replace(".json", ""),
+                model_name,
+                model_postfix,
+                tokenization_name
+            ]
+            wandb_mode = 'disabled' if args.test_mode else 'online'
+            wandb.init(project="Classify", config=config, tags=tags, mode=wandb_mode)
+            wandb.define_metric("loss", summary='min')
+            wandb.define_metric("accuracy", summary='max')
+
+            # Split and prepare training data
+            train_set, test_set = trainer.split_and_prepare(tokenizer, dataset['data'], cap_size=args.set_size)
+
+            num_tokens = len(tokenizer)
+            added_tokens = len(tokenizer.get_added_vocab())
+            num_labels = len(label_encoder.classes_)
+
+            print(f"Model {training_set_name}/{tokenization_name}: {num_tokens} tokens, added: {added_tokens}, {num_labels} labels")
 
 
-    #
-    # Initialize Trainer
-    #
-    if model_name == "BERT" or model_name == "BART":
-        trainer = ClassificationTrainer(hp, label_encoder=label_encoder)
-    elif model_name == "LSTM":
-        trainer = LSTMClassificationTrainer(hp, tokenizer, label_encoder)
-    elif model_name == "SIMPLE":
-        trainer = SimpleClassificationTrainer(hp, label_encoder=label_encoder)
-    else:
-        print("No such model: " + model_name)
-        return
 
-    # Initialize weights & biases
-    config = {
-        "model": model_name,
-        "optimizer": "AdamW",
-        "criterion": "CrossEntropy",
-        "training_set": training_set_name,
-
-        "batch_size": hp.batch_size,
-        "input_size": hp.input_size,
-        "batch_eval_count": hp.print_every,
-
-        "num_epochs": hp.num_epochs,
-        "learning_rate": hp.learning_rate,
-        "gradient_clipping_max": hp.max_norm,
-
-        "tokenization": args.tokenize,
-        "layers": args.layers
-    }
-    tags = [
-        "Classify",
-        training_set_name.replace(".json", ""),
-        model_name,
-        model_postfix,
-        args.tokenize
-    ]
-    wandb_mode = 'disabled' if args.test_mode else 'online'
-    wandb.init(project="Classify", config=config, tags=tags, mode=wandb_mode)
-    wandb.define_metric("loss", summary='min')
-    wandb.define_metric("accuracy", summary='max')
-
-    # Split and prepare training data
-    train_set, test_set = trainer.split_and_prepare(tokenizer, dataset['data'], tokenizer_name, cap_size=args.set_size)
-    if save_tokenizer:
-        Common.save_tokenizer(tokenizer, training_set_name, word_wise)
-    if save_label_encoder:
-        Common.save_label_encoder(label_encoder, tokenizer_name)
-
-    print("Preprocessing done.")
-    if args.preprocess_only:
-        return
-
-    #
-    # Define Model
-    #
-
-    if model_name == "BERT":
-        config = BertConfig.from_pretrained('bert-base-uncased', )
-        if args.layers <= 0:
-            args.layers = config.num_hidden_layers
-        model = BertForSequenceClassification.from_pretrained('bert-base-uncased',
-                                                              num_labels=len(label_encoder.classes_),
-                                                              num_hidden_layers=args.layers
-                                                              )  # BERT + Linear Layer
-        model.resize_token_embeddings(len(tokenizer))
-        metrics = ClassificationMetrics(label_encoder)
-        optimizer = AdamW(model.parameters(), lr=hp.learning_rate)
-        optimizer = TrainUtil.NoamOptim(optimizer, config.hidden_size)
-
-    elif model_name == "BART":
-        config = BartConfig.from_pretrained('facebook/bart-base')
-        config.num_labels = len(label_encoder.classes_)
-        if args.layers > 0:
-            config.num_hidden_layers = args.layers
-        model = BartForSequenceClassification.from_pretrained('facebook/bart-base',
-                                                              config=config)  # BART Decoder-Encoder for Seq2Seq
-        model.resize_token_embeddings(len(tokenizer))
-        metrics = ClassificationMetrics(label_encoder)
-        optimizer = AdamW(model.parameters(), lr=hp.learning_rate)
-        optimizer = TrainUtil.NoamOptim(optimizer, config.d_model)
-
-    elif model_name == "SIMPLE":
-        layers = 3 if args.layers < 0 else args.layers
-        model = BaseLines.SimpleClassifier(len(tokenizer), len(label_encoder.classes_),
-                                           hidden_dim=512,
-                                           num_layers=layers)
-        metrics = ClassificationMetrics(label_encoder)
-        optimizer = AdamW(model.parameters(), lr=hp.learning_rate)
-        optimizer = TrainUtil.NoamOptim(optimizer, 512)
-
-    elif model_name == "LSTM":
-        model = BaseLines.BiLSTMClassifier(len(tokenizer), len(label_encoder.classes_), input_dim=256, hidden_dim=1024)
-        metrics = ClassificationMetrics(label_encoder)
-        optimizer = AdamW(model.parameters(), lr=hp.learning_rate)
-        optimizer = TrainUtil.NoamOptim(optimizer, 1024)
-
-    else:
-        raise NotImplementedError("No such model implemented: " + model_name)
-    model.to(device=hp.device)
-
-    # Initialize criterion
-    criterion = torch.nn.CrossEntropyLoss()
-    criterion.to(hp.device)
-
-    #
-    # Start training
-    #
-
-    trainer.train(model=model, optimizer=optimizer, tokenizer=tokenizer, criterion=criterion, data_set=train_set,
-                  metrics=metrics)
-
-    # Eval
-    trainer.test(model=model, optimizer=optimizer, tokenizer=tokenizer, criterion=criterion, data_set=test_set,
-                 metrics=metrics,
-                 split_into_two=False)
-
-    # Save Model & Optimizer
-    name = "CLASSIFY_" + \
-           training_set_name.replace(".json", "") + \
-           model_name + "_" + \
-           model_postfix + \
-           args.tokenize
-
-    save(name, model=model, tokenizer=tokenizer)
 
 
 def count_full_hit_percentage(labels, predicted):

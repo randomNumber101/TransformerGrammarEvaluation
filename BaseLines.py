@@ -15,7 +15,7 @@ from transformers import BartForSequenceClassification
 
 
 class SimpleTransformer(nn.Module):
-    def __init__(self, vocab_size: int, ntokens=512, d_model=512, num_layers=3, bidirectional=False, device="cpu"):
+    def __init__(self, vocab_size: int, ntokens=512, d_model=512, num_layers=6, bidirectional=False, device="cpu"):
         super().__init__()
         self.d_model = d_model
         self.src_embed = nn.Embedding(vocab_size, self.d_model)
@@ -95,6 +95,7 @@ class Seq2SeqBiLSTM(nn.Module):
 
     def __init__(self, vocab_size, input_dim=256, hidden_dim=1024, num_layers=1, dropout=0.2, device="cpu"):
         super(Seq2SeqBiLSTM, self).__init__()
+        self.d_model = hidden_dim
         self.attention = BahdanauAttention(hidden_dim)
         self.src_embed = nn.Embedding(vocab_size, input_dim)
         self.trg_embed = nn.Embedding(vocab_size, input_dim)

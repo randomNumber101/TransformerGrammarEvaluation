@@ -5,6 +5,7 @@ import re
 import sys
 import argparse
 
+import fairseq.models.transformer
 import torch
 import textdistance
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
@@ -23,6 +24,34 @@ from operator import itemgetter
 from DataUtil import load_data
 import Common
 
+
+# This code is from https://colab.research.google.com/github/jaygala24/pytorch-implementations/blob/master/Attention%20Is%20All%20You%20Need.ipynb#scrollTo=TWOqbtFNzcU_
+class NoamOptim(object):
+    """ Optimizer wrapper for learning rate scheduling.
+    """
+
+    def __init__(self, optimizer, d_model, factor=2, n_warmup_steps=4000):
+        self.optimizer = optimizer
+        self.d_model = d_model
+        self.factor = factor
+        self.n_warmup_steps = n_warmup_steps
+        self.n_steps = 0
+
+    def zero_grad(self):
+        self.optimizer.zero_grad()
+
+    def step(self):
+        self.n_steps += 1
+        lr = self.get_lr()
+        for p in self.optimizer.param_groups:
+            p['lr'] = lr
+        self.optimizer.step()
+
+    def get_lr(self):
+        return self.factor * (
+                self.d_model ** (-0.5)
+                * min(self.n_steps ** (-0.5), self.n_steps * self.n_warmup_steps ** (-1.5))
+        )
 
 def get_attended_token_count(mask):
     # expecting shape (batch_size, seq_length)
@@ -49,6 +78,19 @@ class Metrics(ABC):
         pass
 
 
+def get_bracket_depth(bracketed_string: str):
+    max_count = 0
+    current_open = 0
+    for c in bracketed_string:
+        if c == "(":
+            current_open += 1
+            max_count = max(max_count, current_open)
+        elif c == ")":
+            current_open -= 1
+    return max_count
+
+
+
 class Trainer(ABC):
     def __init__(self, hp):
         self.hp = hp
@@ -71,14 +113,11 @@ class Trainer(ABC):
     def generate(self, model, batch):
         pass
 
-    def split_and_prepare(self, tokenizer, data, split_test=False, cap_size=-1):
-        # Sort by sequence length, log lengths
-        set_size = len(data)
-        if not cap_size >= set_size and cap_size != -1:
-            data = random.sample(data, cap_size)
-            set_size = len(data)
-        data.sort(key=(lambda entry: len(entry.get('i'))))  # sort by input length
-
+    def _process_data(self, tokenizer, data, sort_by_bracket_depth, set_size):
+        if not sort_by_bracket_depth:
+            data.sort(key=(lambda entry: len(entry.get('i'))))  # sort by input length
+        else:
+            data.sort(key=(lambda entry: get_bracket_depth(entry.get('i'))))
 
         # Log data metrics
         print(f"Dataset size: {len(data)}")
@@ -111,7 +150,24 @@ class Trainer(ABC):
         })
 
         # Sort data
-        input_ids, input_masks, label_ids, label_masks = sort_by_length(input_ids, input_masks, label_ids, label_masks)
+        return tuple(sort_by_length(input_ids, input_masks, label_ids, label_masks))
+
+    def split_and_prepare(self, tokenizer, data, tokenizer_name, sort_by_bracket_depth=False, cap_size=-1):
+        # Sort by sequence length, log lengths
+        set_size = len(data)
+        if not cap_size >= set_size and cap_size != -1:
+            data = random.sample(data, cap_size)
+            set_size = len(data)
+
+        from_file_buffer = Common.load_tensor_data(tokenizer_name)
+        if not from_file_buffer:
+            print(f"No preprocessed data found for {tokenizer_name}. Preprocessing data instead.")
+            data = self._process_data(tokenizer, data, sort_by_bracket_depth, set_size)
+            print(f"Preprocessing done. Saving data locally.")
+            Common.save_tensor_data(tokenizer_name, data)
+        else:
+            data = from_file_buffer
+        input_ids, input_masks, label_ids, label_masks = data
 
         # Split ids and masks for inputs and labels into test and training sets, respectively
         train = {}
@@ -132,6 +188,7 @@ class Trainer(ABC):
         data_set_size = len(data_loader)
         print_every = self.hp.print_every if self.hp.print_every else int(data_set_size / 10)
         print_every = max(print_every, 1)
+
 
         print(">> Training Started <<")
         for epoch in range(num_epochs):
@@ -154,8 +211,10 @@ class Trainer(ABC):
 
                 # back propagate
                 loss.backward()
+
                 # Apply gradient clipping
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=self.hp.max_norm)
+                # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=self.hp.max_norm) # Disabled gradient clipping
+
                 # update optimizer
                 optimizer.step()
 
