@@ -90,7 +90,7 @@ class SimpleClassifier(nn.Module):
 class Seq2SeqBiLSTM(nn.Module):
     """
     A standard Encoder-Decoder architecture. Base for this and many
-    other models.
+    other models_data.
     """
 
     def __init__(self, vocab_size, input_dim=256, hidden_dim=1024, num_layers=1, dropout=0.2, device="cpu"):

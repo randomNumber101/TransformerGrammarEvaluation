@@ -1,5 +1,6 @@
 import json
 import os.path
+from typing import List
 
 import fairseq.tasks.translation
 import torch
@@ -17,6 +18,49 @@ def load_data(filepath):
     with open(filepath, 'r') as f:
         d = json.load(f)
     return d
+
+
+def calculate_token_depth(tokens: list[str], position: int):
+    unclosed = 0
+    for i, token in enumerate(tokens):
+        if i >= position: break
+        if "(" in token:
+            unclosed += 1
+        elif ")" in token:
+            unclosed -= 1
+    return unclosed
+
+
+def find_bracket_left(tokens: list[str], position: int, rank: int):
+    unmatched = 0
+    for i in reversed(range(0, position)):
+        token = tokens[i]
+        if "(" in token:
+            unmatched += 1
+        elif ")" in token:
+            unmatched -= 1
+        if unmatched == rank or i == 0:
+            return i
+
+
+def find_bracket_right(tokens: list[str], position: int, rank: int):
+    unmatched = 0
+    for i in range(position, len(tokens)):
+        token = tokens[i]
+        if ")" in token:
+            unmatched += 1
+        elif "(" in token:
+            unmatched -= 1
+        if unmatched == rank or i + 1 == len(tokens):
+            return i
+
+
+# Calculates the span width in #tokens of the rank respective subtree
+def calculate_span(tokens: list[str], position: int, rank: int):
+    left_bracket_idx = find_bracket_left(tokens, position, rank)
+    right_bracket_idx = find_bracket_right(tokens, position, rank)
+    return right_bracket_idx - left_bracket_idx
+
 
 
 def convert_to_single_files(dest_dir, dataset_name, data_dict, tokenizer, test_portion=0.3, valid_portion=0.1):
@@ -127,5 +171,6 @@ class FairseqWrapper(FairseqDataset):
 
 if __name__ == "__main__":
     print("Starting script...")
-    build_preprocessed()
+    tokenize_all()
+    #build_preprocessed()
     print("Done")

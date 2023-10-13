@@ -27,7 +27,7 @@ class HyperParams:
         self.num_epochs = 5
 
         self.learning_rate = 1e-4
-        self.max_norm = 1.0  # Used for gradient clipping
+        self.max_norm = -1  # Used for gradient clipping
 
         # Printing
         self.print_every = None
@@ -66,14 +66,23 @@ def loadParams():
     parser.add_argument('-pe', '--print_every', type=int, help="Frequency of logging results")
     parser.add_argument('-test', '--test_mode', help="Test mode. Deactivates wandb.", action='store_true')
     parser.add_argument('-l', '--layers', type=int, help="Number of layers", default=-1)
-    parser.add_argument('-tok', '--tokenize', type=str, help="Tokenization strategy [bpe, words, bracket_bpe]",
+    parser.add_argument('-tok', '--tokenize', type=str, help="Tokenization strategy [bpe, words, pure_bpe]",
                         default="bpe")
     parser.add_argument('-eval', '--eval', help="Evaluation mode. Supply dataset.", action='store_true')
-    parser.add_argument("-load", '--load', help="Loads models from pth file.", action='store_true')
+    parser.add_argument('--eval_from', help="Dataset to use for evaluation", type=str, default=None)
+    parser.add_argument("-load", '--load', help="Loads models_data from pth file.", action='store_true')
     parser.add_argument('-ds', '--set_size', type=int, help="How much of the dataset to load. Default: -1.", default=-1)
     parser.add_argument('-bracket', '--bracket_depth', help="Sort eval set by bracket depth (labels).",
                         action='store_true')
-    parser.add_argument('-pp', "--preprocess-only", help="Stops after pre-processing training data. Supply dataset.", action='store_true')
+    parser.add_argument('-pp', "--preprocess-only", help="Stops after pre-processing training data. Supply dataset.",
+                        action='store_true')
+    parser.add_argument('-project', '--wandb_project', type=str, help="Project name to upload data to.", default=None)
+
+    parser.add_argument('-noopt', "--no_optimizer", help="Deactivate Noam Optimization (inverse sqrt lr scheduler).",
+                        action='store_true')
+
+    parser.add_argument('-nopre', "--no_pretrained_weight", help="Initialize models without pretrained weights", action="store_true")
+
 
     args = parser.parse_args()
 
@@ -86,15 +95,14 @@ def loadParams():
     return args, hp
 
 
-ModelTokenizer = typing.TypeVar('ModelTokenizer', bound=PreTrainedTokenizer)
-
-
-def bracket_tokenizer_of(SupClass: ModelTokenizer):
+def bracket_tokenizer_of(SupClass: type[PreTrainedTokenizer]):
     class BracketTokenizer(SupClass):
         def __init__(self, *args, **kwargs):
-            super(BracketTokenizer, self).__init__(*args, **kwargs, add_prefix_space=True)
+            kwargs["add_prefix_space"] = True
+            super(BracketTokenizer, self).__init__(*args, **kwargs)
             # Regex: Either open bracket with a type (word), closed bracket or a string not containing brackets or space.
-            self.token_pattern = r"\(\w*|\)|[^()\s]+|\s+"
+
+            self.token_pattern = r"\(\w*|\)|[^()]+"
             self.bracket_ids = {}
             self.next_bracket_id_index = 0
             self.bracket_types = set()
@@ -120,7 +128,6 @@ def bracket_tokenizer_of(SupClass: ModelTokenizer):
             return self
 
         def get_bracket_token(self, bracket_type, opening):
-            t = None
             if not opening:
                 t = ')' + bracket_type
             else:
@@ -156,8 +163,10 @@ def bracket_tokenizer_of(SupClass: ModelTokenizer):
                     split_tokens.append(token)
                 else:
                     if self.do_word_wise:
-                        self._add_token(token)
-                        split_tokens.append(token)
+                        words = token.split()
+                        for word in words:
+                            self._add_token(word)
+                            split_tokens.append(word)
                     else:
                         split_tokens.extend(super(BracketTokenizer, self)._tokenize(token))
             return split_tokens
@@ -169,19 +178,25 @@ def bracket_tokenizer_of(SupClass: ModelTokenizer):
     return BracketTokenizer
 
 
-def save(name, model, tokenizer: PreTrainedTokenizer, optimizer=None):
+def save(path, name, model, optimizer=None):
+    full_path = os.path.join(result_folder, path)
+    if not os.path.exists(full_path):
+        os.makedirs(full_path)
     torch.save({
         'model': model.state_dict(),
         'optimizer': optimizer.state_dict() if optimizer is not None else {}
-    }, os.path.join(result_folder, name + ".pth"))
-    tokenizer.save_pretrained(result_folder)
-    print("Saved model and tokenizer to " + result_folder + " with name: " + name + ".")
+    }, os.path.join(full_path, name + ".pth"))
+    print("Saved model and optimizer to " + result_folder + " with name: " + name + ".")
 
 
-def get_state_dict(file):
-    path = os.path.join(result_folder, file + ".pth")
-    model_dict = torch.load(path)
-    return model_dict['model']
+def get_state_dict(file_name, path=None):
+    path = path if path else "."
+    path = os.path.join(result_folder, path, file_name + ".pth")
+    if os.path.isfile(path):
+        model_dict = torch.load(path)
+        return model_dict['model']
+    print(f"Could not load {file_name} from path {str(path)}")
+    return None
 
 
 def get_tokenizer_name(train_set: str, word_wise=False):
@@ -197,7 +212,10 @@ def save_tokenizer(tokenizer: PreTrainedTokenizer, set_name, word_wise=False):
 def load_tokenizer(baseclass: PreTrainedTokenizer, set_name, word_wise=False):
     path = os.path.join(tokenizer_folder, get_tokenizer_name(set_name, word_wise))
     if os.path.exists(path):
-        return baseclass.from_pretrained(path)
+        tokenizer = baseclass.from_pretrained(path)
+        if word_wise:
+            return tokenizer.word_wise()
+        return tokenizer
     return None
 
 
@@ -206,6 +224,8 @@ def save_label_encoder(encoder: LabelEncoder, tokenizer_name: str):
     if not os.path.exists(path):
         os.makedirs(path)
     numpy.save(os.path.join(path, 'classes.npy'), encoder.classes_)
+
+
 def load_label_encoder(tokenizer_name: str):
     path = os.path.join(tokenizer_folder, tokenizer_name, "classes.npy")
     if os.path.isfile(path):
@@ -215,7 +235,7 @@ def load_label_encoder(tokenizer_name: str):
     return None
 
 
-def save_tensor_data(tokenizer_name, data: Tuple[Tensor, Tensor, Tensor, Tensor]):
+def save_tensor_data(tokenizer_name, data: Tuple[Tensor, Tensor, Tensor, Tensor], stats=None):
     in_ids, in_masks, l_ids, l_masks = data
     folder = os.path.join(tensor_data_folder, tokenizer_name)
     if not os.path.exists(folder):
@@ -223,9 +243,11 @@ def save_tensor_data(tokenizer_name, data: Tuple[Tensor, Tensor, Tensor, Tensor]
     torch.save((in_ids, in_masks), os.path.join(folder, "input.pt"))
     torch.save((l_ids, l_masks), os.path.join(tensor_data_folder, tokenizer_name, "label.pt"))
     print(f"Successfully saved preprocessed tensor data for {tokenizer_name}.")
+    if stats:
+        torch.save(stats,  os.path.join(tensor_data_folder, tokenizer_name, "stats.obj"))
+        print(f"Successfully saved preprocessed statistics data for {tokenizer_name}.")
 
-
-def load_tensor_data(tokenizer_name=None):
+def load_tensor_data(tokenizer_name=None, return_stats=False):
     if not tokenizer_name:
         return None
     path = os.path.join(tensor_data_folder, tokenizer_name)
@@ -235,7 +257,16 @@ def load_tensor_data(tokenizer_name=None):
     print(f"Successfully loaded pre-processed input data data from {tokenizer_name}.")
     l_ids, l_masks = torch.load(os.path.join(path, "label.pt"))
     print(f"Successfully loaded pre-processed label data data from {tokenizer_name}.")
-    return in_ids, in_masks, l_ids, l_masks
+    if not return_stats:
+        return in_ids, in_masks, l_ids, l_masks
+    try:
+        stats = torch.load(os.path.join(tensor_data_folder, tokenizer_name, "stats.obj"))
+    except Exception as err:
+        print("No stats found in path. Preprocessing from json file instead.")
+        return None
+    print(f"Successfully loaded pre-processed statistics data data from {tokenizer_name}.")
+    return (in_ids, in_masks, l_ids, l_masks), stats
+
 
 
 def get_optimizer_dict(file):

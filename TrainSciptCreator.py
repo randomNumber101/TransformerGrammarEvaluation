@@ -7,7 +7,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('-app', '--append', nargs='+', type=str, help="Further static string to add to script calls")
 parser.add_argument('-script', '--script', type=str, help="The data set", required=True)
 parser.add_argument('-sets', '--sets', nargs='+', type=str, help="The data set", required=True)
-parser.add_argument('-m', '--models', nargs='+', type=str, help="Model to use [TRANSF, LSTM]", default="TRANSF"),
+parser.add_argument('-m', '--models_data', nargs='+', type=str, help="Model to use [TRANSF, LSTM]", default="TRANSF"),
 parser.add_argument('-bs', '--batch_sizes', nargs='+', type=int, help="Batch size")
 parser.add_argument('-is', '--in_sizes', nargs='+', type=int, help="Input (and output) Length of the network")
 parser.add_argument('-l', '--layer_counts', nargs='+', type=int, help="Number of layers")
@@ -27,7 +27,7 @@ epochs = args.epochs
 models = args.models
 tokenizations = args.tokenizations
 
-configurable = ["sets", "batch_sizes", "in_sizes", "layer_counts", "epochs", "models", "tokenizations", "test"]
+configurable = ["sets", "batch_sizes", "in_sizes", "layer_counts", "epochs", "models_data", "tokenizations", "test"]
 
 for key in configurable:
     value = getattr(args, key)
@@ -47,7 +47,7 @@ def create_single_call(script, train_set=None, batch_size=None, in_size=None, la
     test = "-test " if args.test[0] is not None and args.test[0] else ""
 
     call = f"{script} {train_set}{batch_size}{in_size}{layer_count}{epochs}{model}{tokenization}{test}"
-    call += " && \\ \nrm -r models/wandb && \\\n"
+    call += " && \\ \nrm -r models_data/wandb && \\\n"
     return call
 
 

@@ -1,27 +1,19 @@
 from abc import ABC, abstractmethod
 import os.path
 import random
-import re
-import sys
-import argparse
+from typing import Union
 
-import fairseq.models.transformer
 import torch
-import textdistance
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from torch import Tensor
 
 import wandb
-import numpy as np
-
 from sklearn.model_selection import train_test_split
 
+from torch.utils.data.dataset import Dataset, T_co
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
-from transformers import BartTokenizer, BartForConditionalGeneration
-from torch.optim import AdamW
+
 
 from operator import itemgetter
-
-from DataUtil import load_data
 import Common
 
 
@@ -53,16 +45,33 @@ class NoamOptim(object):
                 * min(self.n_steps ** (-0.5), self.n_steps * self.n_warmup_steps ** (-1.5))
         )
 
+    def state_dict(self):
+        return self.optimizer.state_dict()
+
+    def load_state_dict(self, arg):
+        self.optimizer.load_state_dict(arg)
+
+
 def get_attended_token_count(mask):
     # expecting shape (batch_size, seq_length)
     return torch.count_nonzero(mask, dim=1)
 
+def pick_all(data, entry):
+    return list(map(lambda t: t[entry], data))
 
-def sort_by_length(a, masks, c, d):
-    sorted_tuples = sorted(zip(a, masks, c, d), key=lambda x: torch.count_nonzero(
-        x[1]))  # sort by number of non-zero entries in the input-masks
-    sorted_tensors = (torch.stack(list(map(lambda t: t[i], sorted_tuples))) for i in range(len(sorted_tuples[0])))
+def sort_by_length(a, masks, c, d, return_indices=False):
+    indices = list(range(len(a)))
+    sorted_tuples = sorted(zip(a, masks, c, d, indices),
+                           key=lambda x: torch.count_nonzero(x[1]))  # sort by number of non-zero entries in the input-masks
+    sorted_tensors = tuple(torch.stack(pick_all(sorted_tuples, i)) for i in range(4))
+    indices = pick_all(sorted_tuples, 4)
+    if return_indices:
+        return sorted_tensors, indices
     return sorted_tensors
+def take_n(a, m, c, d, n):
+    out = list(zip(a,m,c,d))[-n:]
+    return tuple(torch.stack(pick_all(out, i)) for i in range(4))
+
 
 class Metrics(ABC):
     @abstractmethod
@@ -90,16 +99,47 @@ def get_bracket_depth(bracketed_string: str):
     return max_count
 
 
+class TensorListDataset(Dataset):
+    def __init__(self, tensors: TensorDataset, list: list[object]):
+        self.tensors = tensors
+        self.list = list
+
+    def __getitem__(self, index) -> T_co:
+        return self.tensors[index], self.list[index]
+
+    def __len__(self):
+        return len(self.tensors)
+
+
+
 
 class Trainer(ABC):
     def __init__(self, hp):
         self.hp = hp
+        self.save_dir = "."
+        self.best_loss = float("inf")
 
     def decode_tokens(self, tokenizer, ids) -> list[str]:
         raise NotImplementedError("This trainer does not support decoding ids.")
 
+    def save(self, model, loss, optimizer=None):
+        save_dir = os.path.join(self.save_dir, "checkpoints")
+        if loss < self.best_loss:
+            Common.save(save_dir, "checkpoint_best", model)
+            self.best_loss = loss
+        else:
+            Common.save(save_dir, "checkpoint_last", model, optimizer)
+
+    def load_state_dict(self):
+        save_dir = os.path.join(self.save_dir, "checkpoints")
+        best = Common.get_state_dict("checkpoint_best", path=save_dir)
+        if best:
+            print("Loaded best model state dict.")
+            return best
+        return Common.get_state_dict("checkpoint_last", path=save_dir)
+
     @abstractmethod
-    def encode(self, inputs, labels, tokenizer) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def encode(self, inputs, labels, tokenizer, return_entry_ids=False) -> Union[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[int]]]:
         pass
 
     def update_metrics(self, metrics: Metrics, batch, outputs):
@@ -113,11 +153,17 @@ class Trainer(ABC):
     def generate(self, model, batch):
         pass
 
-    def _process_data(self, tokenizer, data, sort_by_bracket_depth, set_size):
-        if not sort_by_bracket_depth:
-            data.sort(key=(lambda entry: len(entry.get('i'))))  # sort by input length
-        else:
-            data.sort(key=(lambda entry: get_bracket_depth(entry.get('i'))))
+    def _process_data(self, tokenizer, data, return_stats=False, cap_size=-1, take_longest=True):
+        # Sort by sequence length, log lengths
+        data.sort(key=(lambda entry: len(entry.get('i'))))  # sort by input length
+        set_size = len(data)
+        if not cap_size >= set_size and cap_size != -1:
+            if not take_longest:
+                data = random.sample(data, cap_size)
+            else:
+                data = data[-cap_size:]
+            set_size = len(data)
+
 
         # Log data metrics
         print(f"Dataset size: {len(data)}")
@@ -135,7 +181,9 @@ class Trainer(ABC):
         # encode inputs & labels
         inputs = [entry.get("i") for entry in data]
         labels = [entry.get("l") for entry in data]
-        input_ids, input_masks, label_ids, label_masks = self.encode(inputs=inputs, labels=labels, tokenizer=tokenizer)
+
+        entry_ids, input_ids, input_masks, label_ids, label_masks = self.encode(inputs=inputs, labels=labels, tokenizer=tokenizer, return_entry_ids=True)
+
 
         # Log Encoded lengths
         lengths = list(map(lambda x: torch.count_nonzero(x).item(), input_masks))
@@ -150,45 +198,86 @@ class Trainer(ABC):
         })
 
         # Sort data
-        return tuple(sort_by_length(input_ids, input_masks, label_ids, label_masks))
+        if not return_stats:
+            return tuple(sort_by_length(input_ids, input_masks, label_ids, label_masks))
+        else:
+            stats = [entry.get("stats") for entry in data]
+            stats = [stats[i] for i in entry_ids]
+            return (input_ids, input_masks, label_ids, label_masks), stats
 
-    def split_and_prepare(self, tokenizer, data, tokenizer_name, sort_by_bracket_depth=False, cap_size=-1):
-        # Sort by sequence length, log lengths
-        set_size = len(data)
-        if not cap_size >= set_size and cap_size != -1:
-            data = random.sample(data, cap_size)
-            set_size = len(data)
+    def split_and_prepare(self, tokenizer, data, tokenizer_name, cap_size=-1, test_portion=0.3, train_portion=None, return_stats=False, take_longest=False):
 
-        from_file_buffer = Common.load_tensor_data(tokenizer_name)
+        from_file_buffer = Common.load_tensor_data(tokenizer_name, return_stats=return_stats)
         if not from_file_buffer:
             print(f"No preprocessed data found for {tokenizer_name}. Preprocessing data instead.")
-            data = self._process_data(tokenizer, data, sort_by_bracket_depth, set_size)
+            data = self._process_data(tokenizer, data, return_stats, cap_size, take_longest)
             print(f"Preprocessing done. Saving data locally.")
-            Common.save_tensor_data(tokenizer_name, data)
+            if return_stats:
+                data, stats = data
+                Common.save_tensor_data(tokenizer_name, data, stats)
+            else:
+                Common.save_tensor_data(tokenizer_name, data)
         else:
             data = from_file_buffer
+            if return_stats:
+                data, stats = data
+            set_size = len(data[0])
+            if not cap_size >= set_size and cap_size != -1:
+                sample_indices = random.sample(range(set_size), cap_size)
+                sample_indices.sort()
+                data = (tensor[sample_indices] for tensor in data)
+                if return_stats:
+                    stats = [stats[i] for i in sample_indices]
         input_ids, input_masks, label_ids, label_masks = data
 
-        # Split ids and masks for inputs and labels into test and training sets, respectively
-        train = {}
-        test = {}
-        train['in_ids'], test['in_ids'], train['in_masks'], test['in_masks'], \
-        train['l_ids'], test['l_ids'], train['l_masks'], test['l_masks'] = \
-            train_test_split(input_ids, input_masks, label_ids, label_masks, test_size=0.3, random_state=420,
-                             shuffle=False)
+        if not return_stats:
+            # Split ids and masks for inputs and labels into test and training sets, respectively. Sorth by length.
+            train = {}
+            test = {}
+            train['in_ids'], test['in_ids'], train['in_masks'], test['in_masks'], \
+            train['l_ids'], test['l_ids'], train['l_masks'], test['l_masks'] = \
+                train_test_split(input_ids, input_masks, label_ids, label_masks, test_size=test_portion,
+                                  random_state=420, shuffle=False)
+            train_set = TensorDataset(*sort_by_length(*itemgetter('in_ids', 'in_masks', 'l_ids', 'l_masks')(train)))
+            test_set = TensorDataset(*sort_by_length(*itemgetter('in_ids', 'in_masks', 'l_ids', 'l_masks')(test)))
 
-        train_set = TensorDataset(*sort_by_length(*itemgetter('in_ids', 'in_masks', 'l_ids', 'l_masks')(train)))
-        test_set = TensorDataset(*sort_by_length(*itemgetter('in_ids', 'in_masks', 'l_ids', 'l_masks')(test)))
-        return train_set, test_set
+            return train_set, test_set
 
-    def train(self, model, optimizer, tokenizer, criterion, data_set, metrics: Metrics):
+        else:
+            # Return stats too.
+            train = {}
+            test = {}
+            train['in_ids'], test['in_ids'], train['in_masks'], test['in_masks'], \
+            train['l_ids'], test['l_ids'], train['l_masks'], test['l_masks'], \
+                train_stats, test_stats = \
+                train_test_split(input_ids, input_masks, label_ids, label_masks, stats, test_size=test_portion,
+                                  random_state=420, shuffle=False)
+
+            train_tuples, train_indices = sort_by_length(*itemgetter('in_ids', 'in_masks', 'l_ids', 'l_masks')(train), True)
+            test_tuples, test_indices = sort_by_length(*itemgetter('in_ids', 'in_masks', 'l_ids', 'l_masks')(test), True)
+
+            if train_portion:
+                train_size = int(len(train_tuples[0]) * train_portion)
+                train_tuples = take_n(*train_tuples, train_size)
+                train_indices = train_indices[-train_size:]
+
+            train_set = TensorDataset(*train_tuples)
+            test_set = TensorDataset(*test_tuples)
+
+            train_stats = [train_stats[i] for i in train_indices]
+            test_stats = [test_stats[i] for i in test_indices]
+
+            return TensorListDataset(train_set, train_stats), TensorListDataset(test_set, test_stats)
+
+    def train(self, model, optimizer, tokenizer, criterion, data_set: torch.utils.data.Dataset, metrics: Metrics):
         device = self.hp.device
-        num_epochs = self.hp.num_epochs
+        num_epochs = self.hp.num_epochs#
+        has_additional_info = True if isinstance(data_set, TensorListDataset) else False
         data_loader = DataLoader(data_set, batch_size=self.hp.batch_size, shuffle=True, drop_last=True)
         data_set_size = len(data_loader)
         print_every = self.hp.print_every if self.hp.print_every else int(data_set_size / 10)
         print_every = max(print_every, 1)
-
+        save_every = max(int(data_set_size / 3), 300)
 
         print(">> Training Started <<")
         for epoch in range(num_epochs):
@@ -199,11 +288,15 @@ class Trainer(ABC):
             print("Starting Epoch: {}/{}".format(epoch + 1, num_epochs))
             for i, batch in enumerate(data_loader):
                 # Move all tensors to the device
-                batch = tuple(tensor.to(device) for tensor in batch)
+                if has_additional_info:
+                    batch = tuple(tensor.to(device) for tensor in batch[0]), batch[1]
+                else:
+                    batch = tuple(tensor.to(device) for tensor in batch)
 
                 # forward
                 optimizer.zero_grad()
-                outputs, loss = self.forward_to_model(model=model, criterion=criterion, batch=batch)
+                tensor_batch = batch if not has_additional_info else batch[0]
+                outputs, loss = self.forward_to_model(model=model, criterion=criterion, batch=tensor_batch)
 
                 # Update metrics
                 total_loss += loss.item()
@@ -213,7 +306,8 @@ class Trainer(ABC):
                 loss.backward()
 
                 # Apply gradient clipping
-                # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=self.hp.max_norm) # Disabled gradient clipping
+                if self.hp.max_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=self.hp.max_norm)
 
                 # update optimizer
                 optimizer.step()
@@ -228,36 +322,43 @@ class Trainer(ABC):
                     metrics.print(index=i + 1, set_size=data_set_size, prefix=prefix, count=count, epoch=epoch,
                                   loss=total_loss, decoder=lambda x: self.decode_tokens(tokenizer, x))
 
-
                     total_loss = 0
                     metrics.reset()
                     if device == "cuda":
                         torch.cuda.empty_cache()
 
+                if (i + 1) % save_every == 0 or (i + 1) == data_set_size:
+                    self.save(model, loss.item(), optimizer)
+
     def test(self, model, optimizer, tokenizer, criterion, data_set, metrics: Metrics, split_into_two=False, generate=False, log_prefix=None, pad_output_to=-1):
         device = self.hp.device
-
+        has_additional_info = True if isinstance(data_set, TensorListDataset) else False
         data_loader = DataLoader(data_set, batch_size=self.hp.batch_size, shuffle=False, drop_last=True)
         data_set_size = len(data_loader)
         print_every = self.hp.print_every if self.hp.print_every else int(data_set_size / 100)
         print_every = max(print_every, 1)
+        if has_additional_info:
+            print_every = 1
         metrics.reset()
 
         print(">> Evaluation Started <<")
-
         with torch.no_grad():
             model.eval()
             total_loss = 0
 
             for i, batch in enumerate(data_loader):
                 # Move all tensors to the device
-                batch = tuple(tensor.to(device) for tensor in batch)
+                if has_additional_info:
+                    batch = tuple(tensor.to(device) for tensor in batch[0]), batch[1]
+                else:
+                    batch = tuple(tensor.to(device) for tensor in batch)
+                tensor_batch = batch if not has_additional_info else batch[0]
 
                 # forward
                 optimizer.zero_grad()
 
                 if generate:
-                    outputs = self.generate(model, batch)
+                    outputs = self.generate(model, tensor_batch)
                     diff = pad_output_to - outputs.size(1)
                     if pad_output_to > 0 and diff > 0:
                         bs = outputs.size(0)
@@ -269,7 +370,7 @@ class Trainer(ABC):
                     outputs = torch.nn.functional.one_hot(outputs, num_classes=len(tokenizer))
                     loss = torch.tensor(0)
                 else:
-                    outputs, loss = self.forward_to_model(model=model, criterion=criterion, batch=batch)
+                    outputs, loss = self.forward_to_model(model=model, criterion=criterion, batch=tensor_batch)
 
                 # Update metrics
                 total_loss += loss.item()
@@ -295,4 +396,5 @@ class Trainer(ABC):
                     metrics.reset()
                     if device == "cuda":
                         torch.cuda.empty_cache()
+
 

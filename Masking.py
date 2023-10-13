@@ -6,6 +6,7 @@
 """
 import argparse
 import datetime
+import os.path
 import random
 import re
 from datetime import date
@@ -25,7 +26,7 @@ from sklearn.model_selection import train_test_split
 
 from torch.utils.data import TensorDataset, DataLoader
 from transformers import BertTokenizer, BertForSequenceClassification, BartTokenizer, BertConfig, BertTokenizerFast, \
-    BartTokenizerFast, BartConfig, BartForSequenceClassification
+    BartTokenizerFast, BartConfig, BartForSequenceClassification, PreTrainedTokenizer
 from torch.optim import AdamW
 
 from operator import itemgetter
@@ -45,6 +46,11 @@ hp.max_norm = 5.0
 
 def main():
     args, hp = Common.loadParams()
+    args.learning_rate = 1e-5
+    args.max_norm = 0.75
+    hp.learning_rate = args.learning_rate
+    hp.max_norm = args.max_norm
+
     model_name = "BERT" if args.model == "TRANSF" else args.model
     model_postfix = "SMALL" if args.layers > 0 else "PRETRAINED"
 
@@ -76,11 +82,12 @@ def main():
         if args.tokenize == "words":
             TokenizerClass = Common.bracket_tokenizer_of(BartTokenizer)
             word_wise = True
-        elif args.tokenize == "words_bpe":
-            TokenizerClass = Common.bracket_tokenizer_of(BartTokenizer)
-        else:
+        elif args.tokenize == "pure_bpe":
             TokenizerClass = BartTokenizerFast
+        else:
+            TokenizerClass = Common.bracket_tokenizer_of(BartTokenizer)
 
+    # Tokenizer
     tokenizer_name = Common.get_tokenizer_name(training_set_name, word_wise)
     tokenizer = Common.load_tokenizer(TokenizerClass, training_set_name, word_wise=False)
     if not tokenizer:
@@ -93,6 +100,7 @@ def main():
     else:
         print(f"Successfully loaded tokenizer {tokenizer_name} from local files.")
 
+    # Label Encoder
     save_label_encoder = False
     label_encoder = Common.load_label_encoder(tokenizer_name)
     if not label_encoder:
@@ -101,7 +109,6 @@ def main():
         save_label_encoder = True
     else:
         print(f"Successfully loaded label encoder in {tokenizer_name}.")
-
 
     #
     # Initialize Trainer
@@ -117,6 +124,7 @@ def main():
         return
 
     # Initialize weights & biases
+    task = "Classify" if "classify" in training_set_name.lower() else "Masking"
     config = {
         "model": model_name,
         "optimizer": "AdamW",
@@ -135,19 +143,34 @@ def main():
         "layers": args.layers
     }
     tags = [
-        "Classify",
+        task,
         training_set_name.replace(".json", ""),
         model_name,
         model_postfix,
-        args.tokenize
+        args.tokenize,
+        args.eval_from if args.eval_from else ()
     ]
     wandb_mode = 'disabled' if args.test_mode else 'online'
-    wandb.init(project="Classify", config=config, tags=tags, mode=wandb_mode)
+    wandb_project = task if not args.wandb_project else args.wandb_project
+    wandb.init(project=wandb_project, config=config, tags=tags, mode=wandb_mode)
     wandb.define_metric("loss", summary='min')
     wandb.define_metric("accuracy", summary='max')
 
     # Split and prepare training data
-    train_set, test_set = trainer.split_and_prepare(tokenizer, dataset['data'], tokenizer_name, cap_size=args.set_size)
+    if task == "Masking":
+        return_stats, take_longest = True, True
+        test_portion, train_portion = (0.2, 0.1) if args.set_size < 0 or not args.eval else (0.99, None)
+    else:
+        return_stats, take_longest = False, False
+        test_portion, train_portion = 0.3, None
+    if args.eval_from:
+        evaluation_set_name = args.eval_from
+        dataset = load_data(Common.training_folder + evaluation_set_name)  # Load data from file
+        print("Loaded evaluation dataset: " + evaluation_set_name)
+        tokenizer_name = Common.get_tokenizer_name(evaluation_set_name, word_wise)
+    train_set, test_set = trainer.split_and_prepare(tokenizer, dataset['data'], tokenizer_name, cap_size=args.set_size,
+                                                    return_stats=return_stats, take_longest=take_longest,
+                                                    train_portion=train_portion, test_portion=test_portion)
     if save_tokenizer:
         Common.save_tokenizer(tokenizer, training_set_name, word_wise)
     if save_label_encoder:
@@ -162,7 +185,7 @@ def main():
     #
 
     if model_name == "BERT":
-        config = BertConfig.from_pretrained('bert-base-uncased', )
+        config = BertConfig.from_pretrained('bert-base-uncased')
         if args.layers <= 0:
             args.layers = config.num_hidden_layers
         model = BertForSequenceClassification.from_pretrained('bert-base-uncased',
@@ -172,34 +195,36 @@ def main():
         model.resize_token_embeddings(len(tokenizer))
         metrics = ClassificationMetrics(label_encoder)
         optimizer = AdamW(model.parameters(), lr=hp.learning_rate)
-        optimizer = TrainUtil.NoamOptim(optimizer, config.hidden_size)
+        # optimizer = TrainUtil.NoamOptim(optimizer, config.hidden_size)
 
     elif model_name == "BART":
         config = BartConfig.from_pretrained('facebook/bart-base')
         config.num_labels = len(label_encoder.classes_)
-        if args.layers > 0:
-            config.num_hidden_layers = args.layers
+        if args.layers <= 0:
+            args.layers = args.layers = config.num_hidden_layers
+        config.num_hidden_layers = args.layers
         model = BartForSequenceClassification.from_pretrained('facebook/bart-base',
                                                               config=config)  # BART Decoder-Encoder for Seq2Seq
         model.resize_token_embeddings(len(tokenizer))
         metrics = ClassificationMetrics(label_encoder)
         optimizer = AdamW(model.parameters(), lr=hp.learning_rate)
-        optimizer = TrainUtil.NoamOptim(optimizer, config.d_model)
+        # optimizer = TrainUtil.NoamOptim(optimizer, config.d_model)
 
     elif model_name == "SIMPLE":
-        layers = 3 if args.layers < 0 else args.layers
+        args.layers = 6 if args.layers < 0 else args.layers
         model = BaseLines.SimpleClassifier(len(tokenizer), len(label_encoder.classes_),
                                            hidden_dim=512,
-                                           num_layers=layers)
+                                           num_layers=args.layers)
         metrics = ClassificationMetrics(label_encoder)
         optimizer = AdamW(model.parameters(), lr=hp.learning_rate)
-        optimizer = TrainUtil.NoamOptim(optimizer, 512)
+        # optimizer = TrainUtil.NoamOptim(optimizer, 512)
 
     elif model_name == "LSTM":
+        args.layers = 1
         model = BaseLines.BiLSTMClassifier(len(tokenizer), len(label_encoder.classes_), input_dim=256, hidden_dim=1024)
         metrics = ClassificationMetrics(label_encoder)
         optimizer = AdamW(model.parameters(), lr=hp.learning_rate)
-        optimizer = TrainUtil.NoamOptim(optimizer, 1024)
+        # optimizer = TrainUtil.NoamOptim(optimizer, 1024)
 
     else:
         raise NotImplementedError("No such model implemented: " + model_name)
@@ -213,22 +238,31 @@ def main():
     # Start training
     #
 
-    trainer.train(model=model, optimizer=optimizer, tokenizer=tokenizer, criterion=criterion, data_set=train_set,
-                  metrics=metrics)
+    save_path = os.path.join(
+        task,
+        training_set_name.replace(".json", ""),
+        args.tokenize,
+        "layer-count-" + str(args.layers),
+        model_name
+    )
+    trainer.save_dir = save_path
+
+    if not args.eval:
+        trainer.train(model=model, optimizer=optimizer, tokenizer=tokenizer, criterion=criterion, data_set=train_set,
+                      metrics=metrics)
+
+    # Load best checkpoint if possible
+    saved_best = trainer.load_state_dict()
+    if saved_best:
+        print("Loaded saved model for evaluation.")
+        model.load_state_dict(saved_best, False)
+    else:
+        print("Couldn't find saved model. Evaluating with last checkpoint.")
 
     # Eval
     trainer.test(model=model, optimizer=optimizer, tokenizer=tokenizer, criterion=criterion, data_set=test_set,
                  metrics=metrics,
                  split_into_two=False)
-
-    # Save Model & Optimizer
-    name = "CLASSIFY_" + \
-           training_set_name.replace(".json", "") + \
-           model_name + "_" + \
-           model_postfix + \
-           args.tokenize
-
-    save(name, model=model, tokenizer=tokenizer)
 
 
 def count_full_hit_percentage(labels, predicted):
@@ -245,6 +279,11 @@ def certainty(y_true, y_pred):
     return avg_certainty
 
 
+'''
+METRICS
+'''
+
+
 class ClassificationMetrics(TrainUtil.Metrics):
     def __init__(self, label_encoder: LabelEncoder):
         super().__init__()
@@ -254,9 +293,22 @@ class ClassificationMetrics(TrainUtil.Metrics):
         self.decode = lambda x: label_encoder.inverse_transform(x)
         self.last_prefix = ""
         self.current_step = 0
+        self.additional_metrics = {}
+
+    def update_additional_metrics(self, additional_infos):
+        if len(additional_infos) == 0:
+            return
+        for (key, value) in additional_infos.items():
+            if key in self.additional_metrics:
+                self.additional_metrics[key] += torch.mean(additional_infos[key].float())
+            else:
+                self.additional_metrics[key] = torch.mean(additional_infos[key].float())
 
     def update(self, batch, outputs):
-        input_ids, in_masks, labels, _ = batch
+        tensor_batch = batch[0] if len(batch) == 2 else batch
+        additional_infos = batch[1] if len(batch) == 2 else {}
+
+        input_ids, in_masks, labels, _ = tensor_batch
 
         # Move to CPU
         in_masks = in_masks.cpu().detach()
@@ -281,7 +333,13 @@ class ClassificationMetrics(TrainUtil.Metrics):
         full_hit_perc = count_full_hit_percentage(labels, predicted)  # hit %
 
         # Update
+
+        self.update_additional_metrics(additional_infos)
         self.metrics += np.array([avg_lengths, acc, f1, full_hit_perc, cert, err_cert])
+
+    def average_additional_metrics(self, count):
+        for (key, value) in self.additional_metrics.items():
+            self.additional_metrics[key] = value / count
 
     def print(self, index, set_size, prefix, count, epoch, loss, decoder=None):
 
@@ -292,8 +350,14 @@ class ClassificationMetrics(TrainUtil.Metrics):
         avg_loss = loss / count
         metrics = self.metrics / count
         [avg_lengths, accuracy, f1, full_hit_perc, cert, err_cert] = metrics
+
+        self.average_additional_metrics(count)
+        additional_str = ""
+        for key, value in self.additional_metrics.items():
+            additional_str += f", {key}: {str(value.item())}"
+
         print(
-            f"Batch {index}/{set_size} - Loss: {avg_loss:.4f}, Accuracy: {accuracy:.4f}, F1: {f1:.4f}, Lengths: {avg_lengths:.2f}")
+            f"Batch {index}/{set_size} - Loss: {avg_loss:.4f}, Accuracy: {accuracy:.4f}, F1: {f1:.4f}, Lengths: {avg_lengths:.2f} {additional_str}")
 
         if len(self.errors) > 0:
             def decode(er):
@@ -310,7 +374,8 @@ class ClassificationMetrics(TrainUtil.Metrics):
                 inp, label, pred = decode(error)
                 # TODO: Task specific metrix
 
-        wandb.log({
+        additional_metrics = {prefix + key: value for key, value in self.additional_metrics.items()}
+        log_dict = {
             prefix + "in_lengths": avg_lengths,
             prefix + "epoch": epoch,
             prefix + "loss": avg_loss,
@@ -319,14 +384,22 @@ class ClassificationMetrics(TrainUtil.Metrics):
             prefix + "full_hit%": full_hit_perc,
             prefix + "certainty": cert,
             prefix + "stubbornness": err_cert,
-            prefix + "custom_step": self.current_step
-        })
+            prefix + "custom_step": self.current_step,
+        }
+        log_dict.update(additional_metrics)
+        wandb.log(log_dict)
 
         self.current_step += 1
 
     def reset(self):
         self.metrics = np.zeros(6)
         self.errors = []
+        self.additional_metrics = {}
+
+
+'''
+TRAINERS
+'''
 
 
 class ClassificationTrainer(TrainUtil.Trainer):
@@ -362,18 +435,19 @@ class ClassificationTrainer(TrainUtil.Trainer):
         return [self.decode_single(tokenizer, ids[i]) for i in
                 range(ids.size(0))]
 
-    def encode(self, inputs, labels, tokenizer):
+    def encode(self, inputs, labels, tokenizer, return_entry_ids=True):
         mask_token = tokenizer.mask_token
         mask_id = tokenizer.mask_token_id
 
         input_ids = []
         attention_masks = []
         filtered_labels = []
+        entry_ids = []
 
         filtered_count = 0
         max_length = self.hp.input_size if self.hp.input_size > 0 else tokenizer.model_max_length
 
-        for input_text, label in zip(inputs, labels):
+        for i, (input_text, label) in enumerate(zip(inputs, labels)):
             input_text.replace(self.mask_string, mask_token)
 
             encoded = tokenizer.encode_plus(input_text, add_special_tokens=True, padding='max_length',
@@ -384,6 +458,7 @@ class ClassificationTrainer(TrainUtil.Trainer):
                 input_ids.append(encoded['input_ids'])
                 attention_masks.append(encoded['attention_mask'])
                 filtered_labels.append(label)
+                entry_ids.append(i)
             else:
                 filtered_count += 1
 
@@ -398,6 +473,8 @@ class ClassificationTrainer(TrainUtil.Trainer):
         encoded_labels = torch.tensor(self.label_encoder.fit_transform(filtered_labels))
         label_masks = torch.ones(encoded_labels.size())
 
+        if return_entry_ids:
+            return entry_ids, input_ids, attention_masks, encoded_labels, label_masks
         return input_ids, attention_masks, encoded_labels, label_masks
 
     def forward_to_model(self, model, criterion, batch):

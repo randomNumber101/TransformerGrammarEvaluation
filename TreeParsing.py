@@ -4,12 +4,15 @@
     Out:
         ((He))((goes)((to)((the)(mall))))
 """
+import copy
+import os
 import random
 import re
 
 import textdistance
 import torch
 from sklearn.metrics import accuracy_score, f1_score
+from torch import nn
 from torch.nn import CrossEntropyLoss
 
 import BaseLines
@@ -26,9 +29,26 @@ from Common import save
 from DataUtil import load_data
 import Common
 
-
 EPS = 0.05  ## Error EPS
 bracket_pattern = r"\(\w*|\)\w*"
+
+
+def deleteBartLayers(model: BartForConditionalGeneration, num_layers_to_keep):  # must pass in the full bert model
+    oldEncoderList = model.model.encoder.layers
+    oldDecoderList = model.model.decoder.layers
+    newEncoderList = nn.ModuleList()
+    newDecoderList = nn.ModuleList()
+
+    # Now iterate over all layers, only keeping the relevant layers.
+    for i in range(0, num_layers_to_keep):
+        newEncoderList.append(oldEncoderList[i])
+        newDecoderList.append(oldDecoderList[i])
+
+    # create a copy of the model, modify it with the new list, and return
+    copyOfModel = copy.deepcopy(model)
+    copyOfModel.model.encoder.layers = newEncoderList
+    copyOfModel.model.decoder.layers = newEncoderList
+    return copyOfModel
 
 
 def start():
@@ -47,10 +67,10 @@ def start():
     if args.tokenize == "words":
         TokenizerClass = Common.bracket_tokenizer_of(BartTokenizer)
         word_wise = True
-    elif args.tokenize == "bracket_bpe":
-        TokenizerClass = Common.bracket_tokenizer_of(BartTokenizer)
-    else:
+    elif args.tokenize == "pure_bpe":
         TokenizerClass = BartTokenizerFast
+    else:
+        TokenizerClass = Common.bracket_tokenizer_of(BartTokenizer)
 
     tokenizer = Common.load_tokenizer(TokenizerClass, training_set_name, word_wise=word_wise)
     tokenizer_name = Common.get_tokenizer_name(training_set_name, word_wise)
@@ -59,7 +79,8 @@ def start():
         if word_wise:
             tokenizer = tokenizer.word_wise()
         save_tokenizer = True
-        print(f"No saved tokenizer with name {tokenizer_name} has been found in local directory {Common.tokenizer_folder}. A new tokenizer will be trained.")
+        print(
+            f"No saved tokenizer with name {tokenizer_name} has been found in local directory {Common.tokenizer_folder}. A new tokenizer will be trained.")
     else:
         print(f"Successfully loaded tokenizer {tokenizer_name} from local files.")
 
@@ -75,7 +96,8 @@ def start():
 
     # Initialize weights & biases for logging
     config = {
-        "model": "BartForConditionalGeneration" if model_name == "BART" else model_name,
+        "model": (
+                     "BartForConditionalGeneration" if model_name == "BART" else model_name) + "" if not args.no_pretrained_weight else "-SCRATCH",
         "optimizer": "AdamW",
         "criterion": "CrossEntropy",
         "training_set": training_set_name,
@@ -94,7 +116,7 @@ def start():
     tags = [
         "TreeBracketing",
         training_set_name.replace(".json", ""),
-        model_name,
+        model_name + "" if not args.no_pretrained_weight else "-SCRATCH",
         model_postfix,
         args.tokenize
     ]
@@ -104,8 +126,7 @@ def start():
     wandb.define_metric("accuracy", summary='max')
 
     # Split and prepare training data
-    train_set, test_set = trainer.split_and_prepare(tokenizer, dataset['data'], tokenizer_name, cap_size=args.set_size,
-                                                    sort_by_bracket_depth=args.bracket_depth)
+    train_set, test_set = trainer.split_and_prepare(tokenizer, dataset['data'], tokenizer_name, cap_size=args.set_size)
     if save_tokenizer and not args.tokenize == "words_bpe":
         Common.save_tokenizer(tokenizer, training_set_name, word_wise)
 
@@ -113,38 +134,59 @@ def start():
     if args.preprocess_only:
         return
 
-
     # Define Model
     if model_name == "BART":
         config = BartConfig.from_pretrained('facebook/bart-base')
-        if args.layers > 0:
-            config.num_hidden_layers = args.layers
-        model = BartForConditionalGeneration.from_pretrained('facebook/bart-base',
-                                                             config=config)  # BART Decoder-Encoder for Seq2Seq
+
+        if not args.no_pretrained_weight:
+            model = BartForConditionalGeneration.from_pretrained(
+                'facebook/bart-base')  # BART Decoder-Encoder for Seq2Seq
+        else:
+            # Load model without pretrained weights
+            model = BartForConditionalGeneration(config)
+        if args.layers <= 0:
+            args.layers = config.num_hidden_layers
+        else:
+            model = deleteBartLayers(model, args.layers)
         model.resize_token_embeddings(len(tokenizer))
         metrics = TransductionMetrics()
         optimizer = AdamW(model.parameters(), lr=hp.learning_rate, betas=(0.9, 0.98))
-        optimizer = TrainUtil.NoamOptim(optimizer, config.d_model) # Use sqrt lr scheduler
+        if not args.no_optimizer:
+            optimizer = TrainUtil.NoamOptim(optimizer, config.d_model)  # Use sqrt lr scheduler
 
     elif model_name == "SIMPLE" or model_name == "SIMPLE_BI":
-        layers = 6 if not args.layers > 0 else args.layers
+        args.layers = 6 if args.layers <= 0 else args.layers
         is_bidirectional = model_name == "SIMPLE_BI"
-        model = BaseLines.SimpleTransformer(vocab_size=len(tokenizer), num_layers=layers,
+        model = BaseLines.SimpleTransformer(vocab_size=len(tokenizer), num_layers=args.layers,
                                             ntokens=hp.input_size,
                                             bidirectional=is_bidirectional)
         metrics = TransductionMetrics()
         optimizer = AdamW(model.parameters(), lr=hp.learning_rate, betas=(0.9, 0.98))
-        optimizer = TrainUtil.NoamOptim(optimizer, model.d_model)  # Use sqrt lr scheduler
+        if not args.no_optimizer:
+            optimizer = TrainUtil.NoamOptim(optimizer, model.d_model)  # Use sqrt lr scheduler
     else:
+        args.layers = 1
         model = BaseLines.Seq2SeqBiLSTM(vocab_size=len(tokenizer), input_dim=256, hidden_dim=1024, num_layers=1)
         metrics = LSTMTransductionMetrics(model, tokenizer)
         optimizer = AdamW(model.parameters(), lr=hp.learning_rate, betas=(0.9, 0.98))
-        optimizer = TrainUtil.NoamOptim(optimizer, model.d_model)
+        if not args.no_optimizer:
+            optimizer = TrainUtil.NoamOptim(optimizer, model.d_model)
+
+    # Set Save Path
+    save_path = os.path.join(
+        "Bracket",
+        training_set_name.replace(".json", ""),
+        args.tokenize,
+        "layer-count-" + str(args.layers),
+        model_name + "" if not args.no_pretrained_weight else "-scratch"
+    )
+    trainer.save_dir = save_path
 
     # Initialize criterion
     criterion = torch.nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
     criterion.to(hp.device)
 
+    # TODO: REFACTOR
     if args.load:
         name = "BRACKETING_" + \
                training_set_name.replace(".json", "") + \
@@ -163,17 +205,18 @@ def start():
 
     model.to(device=hp.device)
 
+    if not args.eval:
+        # Start training
+        trainer.train(model=model, optimizer=optimizer, tokenizer=tokenizer, criterion=criterion, data_set=train_set,
+                      metrics=metrics)
 
-
-    if args.eval:
-        trainer.test(model=model, optimizer=optimizer, tokenizer=tokenizer, criterion=criterion, data_set=test_set,
-                     metrics=metrics,
-                     split_into_two=False, generate=True, pad_output_to=hp.input_size - 1, log_prefix="EVAL")
-        return
-
-    # Start training
-    trainer.train(model=model, optimizer=optimizer, tokenizer=tokenizer, criterion=criterion, data_set=train_set,
-                  metrics=metrics)
+    # Load best checkpoint if possible
+    saved_best = trainer.load_state_dict()
+    if saved_best:
+        print("Loaded saved model for evaluation.")
+        model.load_state_dict(saved_best, False)
+    else:
+        print("Couldn't find saved model. Evaluating with last checkpoint.")
 
     # Evaluate
     trainer.test(model=model, optimizer=optimizer, tokenizer=tokenizer, criterion=criterion, data_set=test_set,
@@ -181,16 +224,7 @@ def start():
                  split_into_two=False)
 
     # Task specific evaluation
-
-    # Save Model & Optimizer
-    name = "BRACKETING_" + \
-           training_set_name.replace(".json", "") + \
-           model_name + "_" + \
-           model_postfix + \
-           args.tokenize
-
-    if not args.load:
-        save(name, model=model, tokenizer=tokenizer)
+    # TODO
 
 
 def evaluate_model():
@@ -345,16 +379,17 @@ class TransductionTrainer(TrainUtil.Trainer):
         return [tokenizer.decode(ids[i], skip_special_tokens=False, clean_up_tokenization_spaces=True) for i in
                 range(ids.size(0))]
 
-    def encode(self, inputs, labels, tokenizer):
+    def encode(self, inputs, labels, tokenizer, return_entry_ids=False):
         in_ids = []
         in_masks = []
         l_ids = []
         l_masks = []
+        entry_ids = []
 
         filtered_count = 0
         max_length = self.hp.input_size if self.hp.input_size > 0 else tokenizer.model_max_length
 
-        for (i, l) in zip(inputs, labels):
+        for idx, (i, l) in enumerate(zip(inputs, labels)):
             encoded_i = tokenizer.encode_plus(i, add_special_tokens=True, padding='max_length',
                                               max_length=max_length,
                                               return_attention_mask=True, return_tensors='pt')
@@ -368,6 +403,7 @@ class TransductionTrainer(TrainUtil.Trainer):
                 in_masks.append(encoded_i['attention_mask'])
                 l_ids.append(encoded_l['input_ids'])
                 l_masks.append(encoded_l['attention_mask'])
+                entry_ids.append(idx)
             else:
                 filtered_count += 1
 
@@ -380,6 +416,8 @@ class TransductionTrainer(TrainUtil.Trainer):
         l_ids = torch.cat(l_ids, dim=0)
         l_masks = torch.cat(l_masks, dim=0)
 
+        if return_entry_ids:
+            return entry_ids, in_ids, in_masks, l_ids, l_masks
         return in_ids, in_masks, l_ids, l_masks
 
     def forward_to_model(self, model: BartForConditionalGeneration, criterion, batch):
@@ -401,8 +439,8 @@ class SimpleTransductionTrainer(TransductionTrainer):
                         l_masks=l_masks[:, :-1].contiguous())
 
         loss = criterion(outputs.reshape(-1, outputs.shape[-1]), l_ids[:, 1:].reshape(-1))
-        #loss_masked = loss.masked_select(l_masks[:, 1:].reshape(-1) == 1)  # Only compute loss for non-special tokens
-        return outputs, loss #loss_masked.mean()
+        # loss_masked = loss.masked_select(l_masks[:, 1:].reshape(-1) == 1)  # Only compute loss for non-special tokens
+        return outputs, loss  # loss_masked.mean()
 
 
 class LSTMTransductionMetrics(TransductionMetrics):
