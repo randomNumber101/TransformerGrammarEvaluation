@@ -11,6 +11,7 @@ import re
 
 import textdistance
 import torch
+import torchmetrics.functional
 from sklearn.metrics import accuracy_score, f1_score
 from torch import nn
 from torch.nn import CrossEntropyLoss
@@ -21,7 +22,8 @@ import TrainUtil
 import wandb
 import numpy as np
 
-from transformers import BartForConditionalGeneration, BartTokenizer, BartConfig, PreTrainedTokenizer, BartTokenizerFast
+from transformers import BartForConditionalGeneration, BartTokenizer, BartConfig, PreTrainedTokenizer, \
+    BartTokenizerFast, BartModel
 from torch.optim import AdamW
 
 from ModelImpl import TokenEmbedder
@@ -58,6 +60,7 @@ def start():
 
     # Load Training Data
     training_set_name = "Grammar1_7143222753796263824.json" if not args.set_name else args.set_name
+    tokenizer_set_name = training_set_name if not args.tokenizer_name else args.tokenizer_name
     dataset = load_data(Common.training_folder + training_set_name)  # Load data from file
     print("Loaded dataset: " + training_set_name)
 
@@ -72,17 +75,20 @@ def start():
     else:
         TokenizerClass = Common.bracket_tokenizer_of(BartTokenizer)
 
-    tokenizer = Common.load_tokenizer(TokenizerClass, training_set_name, word_wise=word_wise)
+    tokenizer = Common.load_tokenizer(TokenizerClass, tokenizer_set_name, word_wise=word_wise)
+    current_tokenizer_name = Common.get_tokenizer_name(tokenizer_set_name, word_wise)
     tokenizer_name = Common.get_tokenizer_name(training_set_name, word_wise)
+    pretrained_name = "facebook/bart-base" if not args.tok_lang == "de" else "Shahm/bart-german"
+
     if not tokenizer:
-        tokenizer = TokenizerClass.from_pretrained('facebook/bart-base')  # Use default tokenizer
+        tokenizer = TokenizerClass.from_pretrained(pretrained_name)  # Use default tokenizer
         if word_wise:
             tokenizer = tokenizer.word_wise()
         save_tokenizer = True
         print(
-            f"No saved tokenizer with name {tokenizer_name} has been found in local directory {Common.tokenizer_folder}. A new tokenizer will be trained.")
+            f"No saved tokenizer with name {current_tokenizer_name} has been found in local directory {Common.tokenizer_folder}. A new tokenizer will be trained.")
     else:
-        print(f"Successfully loaded tokenizer {tokenizer_name} from local files.")
+        print(f"Successfully loaded tokenizer {current_tokenizer_name} from local files.")
 
     if model_name == "BART":
         trainer = TransductionTrainer(hp)
@@ -97,7 +103,11 @@ def start():
     # Initialize weights & biases for logging
     config = {
         "model": (
-                     "BartForConditionalGeneration" if model_name == "BART" else model_name) + "" if not args.no_pretrained_weight else "-SCRATCH",
+                     "BartForConditionalGeneration" if model_name == "BART" else model_name
+                 ) +
+                 (
+                     "" if not args.no_pretrained_weight else "-SCRATCH"
+                 ),
         "optimizer": "AdamW",
         "criterion": "CrossEntropy",
         "training_set": training_set_name,
@@ -116,17 +126,32 @@ def start():
     tags = [
         "TreeBracketing",
         training_set_name.replace(".json", ""),
-        model_name + "" if not args.no_pretrained_weight else "-SCRATCH",
+        model_name + ("" if not args.no_pretrained_weight else "-SCRATCH"),
         model_postfix,
         args.tokenize
     ]
+    if args.eval_from:
+        tags.append(args.eval_from)
     wandb_mode = 'disabled' if args.test_mode else 'online'
-    wandb.init(project="Tree Bracketing", config=config, tags=tags, mode=wandb_mode)
+    wandb.init(
+        project="Tree Bracketing" if not args.wandb_project else args.wandb_project,
+        config=config, tags=tags,
+        mode=wandb_mode
+    )
     wandb.define_metric("loss", summary='min')
     wandb.define_metric("accuracy", summary='max')
 
     # Split and prepare training data
-    train_set, test_set = trainer.split_and_prepare(tokenizer, dataset['data'], tokenizer_name, cap_size=args.set_size)
+    test_portion = 0.3
+    if args.eval_from:
+        evaluation_set_name = args.eval_from
+        dataset = load_data(Common.training_folder + evaluation_set_name)  # Load data from file
+        print("Loaded evaluation dataset: " + evaluation_set_name)
+        tokenizer_name = Common.get_tokenizer_name(evaluation_set_name, word_wise)
+        test_portion = 0.99
+    force_encoding = args.tokenizer_name is not None
+    train_set, test_set = trainer.split_and_prepare(tokenizer, dataset['data'], tokenizer_name, force_encoding=force_encoding,
+                                                    cap_size=args.set_size, test_portion=test_portion)
     if save_tokenizer and not args.tokenize == "words_bpe":
         Common.save_tokenizer(tokenizer, training_set_name, word_wise)
 
@@ -134,22 +159,25 @@ def start():
     if args.preprocess_only:
         return
 
+
+
     # Define Model
     if model_name == "BART":
-        config = BartConfig.from_pretrained('facebook/bart-base')
+        config = BartConfig.from_pretrained(pretrained_name)
 
         if not args.no_pretrained_weight:
             model = BartForConditionalGeneration.from_pretrained(
-                'facebook/bart-base')  # BART Decoder-Encoder for Seq2Seq
+                pretrained_name)  # BART Decoder-Encoder for Seq2Seq
         else:
             # Load model without pretrained weights
+            config = BartConfig()
             model = BartForConditionalGeneration(config)
         if args.layers <= 0:
             args.layers = config.num_hidden_layers
         else:
             model = deleteBartLayers(model, args.layers)
         model.resize_token_embeddings(len(tokenizer))
-        metrics = TransductionMetrics()
+        metrics = BasicTransductionMetrics()
         optimizer = AdamW(model.parameters(), lr=hp.learning_rate, betas=(0.9, 0.98))
         if not args.no_optimizer:
             optimizer = TrainUtil.NoamOptim(optimizer, config.d_model)  # Use sqrt lr scheduler
@@ -160,15 +188,15 @@ def start():
         model = BaseLines.SimpleTransformer(vocab_size=len(tokenizer), num_layers=args.layers,
                                             ntokens=hp.input_size,
                                             bidirectional=is_bidirectional)
-        metrics = TransductionMetrics()
-        optimizer = AdamW(model.parameters(), lr=hp.learning_rate, betas=(0.9, 0.98))
+        metrics = BasicTransductionMetrics()
+        optimizer = AdamW(model.parameters(), lr=hp.learning_rate, betas=(0.9, 0.98), weight_decay=1e-5)
         if not args.no_optimizer:
             optimizer = TrainUtil.NoamOptim(optimizer, model.d_model)  # Use sqrt lr scheduler
     else:
         args.layers = 1
         model = BaseLines.Seq2SeqBiLSTM(vocab_size=len(tokenizer), input_dim=256, hidden_dim=1024, num_layers=1)
-        metrics = LSTMTransductionMetrics(model, tokenizer)
-        optimizer = AdamW(model.parameters(), lr=hp.learning_rate, betas=(0.9, 0.98))
+        metrics = BasicLSTMTransductionMetrics(model, tokenizer)
+        optimizer = AdamW(model.parameters(), lr=hp.learning_rate, betas=(0.9, 0.98), weight_decay=1e-5)
         if not args.no_optimizer:
             optimizer = TrainUtil.NoamOptim(optimizer, model.d_model)
 
@@ -178,34 +206,52 @@ def start():
         training_set_name.replace(".json", ""),
         args.tokenize,
         "layer-count-" + str(args.layers),
-        model_name + "" if not args.no_pretrained_weight else "-scratch"
+        model_name + ("" if not args.no_pretrained_weight else "-scratch")
     )
     trainer.save_dir = save_path
+
+    # Load model weights if desired
+    if args.init_from:
+        load_path = os.path.join(
+            "Bracket",
+            args.init_from.replace(".json", ""),
+            args.tokenize,
+            "layer-count-" + str(args.layers),
+            model_name + ("" if not args.no_pretrained_weight else "-scratch")
+        )
+        former_save_dir = trainer.save_dir
+        trainer.save_dir = load_path
+        trainer.load_state_dict()
+
+        # Load best checkpoint if possible
+        saved_best = trainer.load_state_dict()
+        if saved_best:
+            print(f"Loaded parameters of model trained on {args.init_from}.")
+            model.load_state_dict(saved_best, False)
+        else:
+            print("Couldn't find saved model. Training new model instead.")
+        trainer.save_dir = former_save_dir
 
     # Initialize criterion
     criterion = torch.nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
     criterion.to(hp.device)
 
-    # TODO: REFACTOR
     if args.load:
-        name = "BRACKETING_" + \
-               training_set_name.replace(".json", "") + \
-               model_name + "_" + \
-               model_postfix + \
-               args.tokenize
         try:
-            state_dict = Common.get_state_dict(name)
-            model.load_state_dict(state_dict, strict=False)
-            print("Loaded model from file: " + name)
-            optimizer.load_state_dict(Common.get_optimizer_dict(name))
-            print("Loaded optimizer from file: " + name)
+            saved_best = trainer.load_state_dict()
+            model.load_state_dict(saved_best, False)
+            print("Loaded model from dir: " + trainer.save_dir)
         except Exception as err:
-            print("Error occurred. Building new optimizer/model instead: " + name)
+            print("Error occurred. Building new optimizer/model instead.")
             print("Error: " + str(err))
 
     model.to(device=hp.device)
 
-    if not args.eval:
+    if args.model_tag:
+        trainer.save_dir = os.path.join(trainer.save_dir, args.model_tag)
+
+
+    if not args.eval and not args.eval_from:
         # Start training
         trainer.train(model=model, optimizer=optimizer, tokenizer=tokenizer, criterion=criterion, data_set=train_set,
                       metrics=metrics)
@@ -218,17 +264,17 @@ def start():
     else:
         print("Couldn't find saved model. Evaluating with last checkpoint.")
 
+    if model_name == "BART":
+        metrics = TransductionMetrics()
+    elif model_name == "SIMPLE" or model_name == "SIMPLE_BI":
+        metrics = TransductionMetrics()
+    else:
+        metrics = LSTMTransductionMetrics(model, tokenizer)
+
     # Evaluate
     trainer.test(model=model, optimizer=optimizer, tokenizer=tokenizer, criterion=criterion, data_set=test_set,
                  metrics=metrics,
                  split_into_two=False)
-
-    # Task specific evaluation
-    # TODO
-
-
-def evaluate_model():
-    pass
 
 
 def calculate_edit_distance(labels, predicted):
@@ -269,7 +315,7 @@ def count_full_hit_percentage(labels, predicted):
 
 class TransductionMetrics(TrainUtil.Metrics):
 
-    def __init__(self):
+    def __init__(self, reduced=False):
         super().__init__()
         self.metrics = np.zeros(5)
         self.errors = []
@@ -363,6 +409,56 @@ class TransductionMetrics(TrainUtil.Metrics):
         self.errors = []
 
 
+class BasicTransductionMetrics(TransductionMetrics):
+
+    def __init__(self):
+        super().__init__()
+        self.acc = 0
+        self.current_prefix = ""
+        self.log_num = 0
+
+    def prepare_data(self, batch, outputs):
+        input_ids, in_masks, l_ids, l_masks = (tensor for tensor in batch)
+        outputs = outputs
+
+        # Adapt
+        l_ids = l_ids[:, 1:]
+        l_masks = l_masks[:, 1:]
+
+        predicted_indices = torch.argmax(outputs, dim=-1)
+        return input_ids, in_masks, l_ids, l_masks, predicted_indices
+
+    def update(self, batch, outputs):
+        with torch.no_grad():
+            input_ids, in_masks, labels, l_masks, predicted_indices = self.prepare_data(batch, outputs)
+            self.acc += ((labels == predicted_indices).sum().item() / labels.numel())  # acc
+
+    def print(self, index, set_size, prefix, count, epoch, loss, decoder=None):
+        if not self.current_prefix == prefix:
+            self.log_num = 0
+            self.current_prefix = prefix
+
+        avg_loss = loss / count
+        avg_acc = self.acc / count
+
+        print(
+            f"Batch {index}/{set_size} - Loss: {avg_loss:.4f}, Accuracy / F1: {avg_acc:.4f}")
+
+        wandb.log({
+            prefix + "epoch": epoch,
+            prefix + "loss": avg_loss,
+            prefix + "accuracy": avg_acc,
+            prefix + "f1": avg_acc,
+            "custom_step": self.log_num
+        })
+
+        self.log_num += 1
+        self.reset()
+
+    def reset(self):
+        self.acc = 0
+
+
 class TransductionTrainer(TrainUtil.Trainer):
     def generate(self, model: BartForConditionalGeneration, batch):
         in_ids, in_masks, l_ids, l_masks = batch
@@ -443,13 +539,38 @@ class SimpleTransductionTrainer(TransductionTrainer):
         return outputs, loss  # loss_masked.mean()
 
 
+class BasicLSTMTransductionMetrics(BasicTransductionMetrics):
+    def __init__(self, model, tokenizer):
+        super().__init__()
+        self.model = model
+        self.tokenizer = tokenizer
+        self.generator = model.generator
+
+    def prepare_data(self, batch, outputs: torch.Tensor):
+        # Find nearest
+        with torch.no_grad():
+            predicted_indices = self.generator(outputs)
+            predicted_indices = torch.argmax(predicted_indices, dim=-1)
+
+            # Move to CPU
+            input_ids, in_masks, labels, l_masks = (tensor for tensor in batch)
+
+            diff_size = labels.size(1) - 1 - predicted_indices.size(1)
+            if diff_size > 0:
+                pad_id = self.tokenizer.pad_token_id
+                batch_size = labels.size(0)
+                size = torch.Size((batch_size, diff_size))
+                predicted_indices = torch.cat((predicted_indices, torch.full(size, pad_id, device=predicted_indices.get_device())), dim=1)
+
+            return input_ids, in_masks, labels[:, 1:], l_masks[:, 1:], predicted_indices
+
+
 class LSTMTransductionMetrics(TransductionMetrics):
     def __init__(self, model, tokenizer):
         super().__init__()
         self.model = model
         self.tokenizer = tokenizer
         self.generator = model.generator
-        self.errors = []
 
     def prepare_data(self, batch, outputs):
         # Find nearest

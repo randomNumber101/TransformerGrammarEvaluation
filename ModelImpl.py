@@ -304,6 +304,7 @@ class AvgClassificationHead(nn.Module):
         return avg
 
 
+
 class AttentionClassificationHead(nn.Module):
     def __init__(self, hiden_dim, class_count):
         super(AttentionClassificationHead, self).__init__()

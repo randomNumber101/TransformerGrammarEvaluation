@@ -1,20 +1,48 @@
+import gc
 from abc import ABC, abstractmethod
 import os.path
 import random
-from typing import Union
+from typing import Union, Sized
 
 import torch
 from torch import Tensor
+from torch.cuda.amp import GradScaler
+from torch.optim import Optimizer
 
 import wandb
 from sklearn.model_selection import train_test_split
 
 from torch.utils.data.dataset import Dataset, T_co
-from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
-
+from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler, Sampler
 
 from operator import itemgetter
+import numpy as np
+from random import shuffle
 import Common
+
+import time
+
+class Timer:
+
+    disabled = []
+    timers = {}
+
+    @staticmethod
+    def disable(name):
+        Timer.disabled.append(name)
+
+    @staticmethod
+    def start(name):
+        Timer.timers[name] = time.time()
+
+    @staticmethod
+    def measure(name, avg_over=1, tag=None):
+        now = time.time()
+        if name not in Timer.disabled:
+            prev = Timer.timers[name]
+            delta = (now - prev) / avg_over
+            print(f"{name} time delta: {str(delta)} - {tag if tag else 'Total'}")
+        Timer.timers[name] = now
 
 
 # This code is from https://colab.research.google.com/github/jaygala24/pytorch-implementations/blob/master/Attention%20Is%20All%20You%20Need.ipynb#scrollTo=TWOqbtFNzcU_
@@ -22,7 +50,7 @@ class NoamOptim(object):
     """ Optimizer wrapper for learning rate scheduling.
     """
 
-    def __init__(self, optimizer, d_model, factor=2, n_warmup_steps=4000):
+    def __init__(self, optimizer: Optimizer, d_model, factor=2, n_warmup_steps=4000):
         self.optimizer = optimizer
         self.d_model = d_model
         self.factor = factor
@@ -48,28 +76,40 @@ class NoamOptim(object):
     def state_dict(self):
         return self.optimizer.state_dict()
 
+    def add_param_group(self, param_group):
+        return self.optimizer.add_param_group(param_group)
+
     def load_state_dict(self, arg):
         self.optimizer.load_state_dict(arg)
+
+    def __getattr__(self, name):
+        # Redirect attribute access to the original object
+        return getattr(self.optimizer, name)
 
 
 def get_attended_token_count(mask):
     # expecting shape (batch_size, seq_length)
     return torch.count_nonzero(mask, dim=1)
 
+
 def pick_all(data, entry):
     return list(map(lambda t: t[entry], data))
+
 
 def sort_by_length(a, masks, c, d, return_indices=False):
     indices = list(range(len(a)))
     sorted_tuples = sorted(zip(a, masks, c, d, indices),
-                           key=lambda x: torch.count_nonzero(x[1]))  # sort by number of non-zero entries in the input-masks
+                           key=lambda x: torch.count_nonzero(
+                               x[1]))  # sort by number of non-zero entries in the input-masks
     sorted_tensors = tuple(torch.stack(pick_all(sorted_tuples, i)) for i in range(4))
     indices = pick_all(sorted_tuples, 4)
     if return_indices:
         return sorted_tensors, indices
     return sorted_tensors
+
+
 def take_n(a, m, c, d, n):
-    out = list(zip(a,m,c,d))[-n:]
+    out = list(zip(a, m, c, d))[-n:]
     return tuple(torch.stack(pick_all(out, i)) for i in range(4))
 
 
@@ -111,6 +151,81 @@ class TensorListDataset(Dataset):
         return len(self.tensors)
 
 
+from random import shuffle
+
+
+class BucketLoader(Sized):
+    def __init__(self, data_source: Dataset, bucket_boundaries, batch_sizes=None, with_stats=False):
+        self.data_source = data_source
+        self.with_stats = with_stats
+        ind_n_len = []
+        for i, p in enumerate(data_source):
+            ind_n_len.append((i, self.get_len(p, with_stats)))
+        self.ind_n_len = ind_n_len
+        self.bucket_boundaries = bucket_boundaries
+        self.batch_sizes = dict((bucket_boundaries[i], batch_sizes[i]) for i in range(len(bucket_boundaries)))
+
+        data_buckets = {}
+        # where p is the id number and seq_len is the length of this id number.
+        for indx, seq_len in self.ind_n_len:
+            pid = self.element_to_bucket_id(indx, seq_len)
+            p = self.unpad_pack(self.data_source[indx], pid, self.with_stats)
+            if pid in data_buckets.keys():
+                data_buckets[pid].append((indx, pid))
+            else:
+                data_buckets[pid] = [(indx, pid)]
+
+        for k, l in data_buckets.items():
+            shuffle(l)
+            batch_size = self.batch_sizes[k]
+            data_buckets[k] = [l[i:i + batch_size] for i in range(0, len(l), batch_size)]
+            print(f"{len(data_buckets[k])} batches of size {batch_size} for sequence length {k}.")
+
+        self.data_buckets = data_buckets
+
+
+    def get_len(self, data_point, with_stats=False):
+        if with_stats:
+            return self.get_len(data_point[0], with_stats=False)
+        return max(
+            torch.count_nonzero(data_point[1]).item(),  # Count inputs
+            torch.count_nonzero(data_point[3]).item())  # Count labels
+
+    def unpad_pack(self, data_point, length, with_stats=False):
+        if with_stats:
+            return self.unpad_pack(data_point[0], length), data_point[1]
+        return tuple(t[:length] if t.numel() > length else t for t in data_point)
+
+    def _pre_collate(self, data, with_stats=False):
+        if not with_stats:
+            return tuple(torch.stack(list(x)) for x in zip(*data))
+        else:
+            stats = [t[-1] for t in data]
+            tensors = [[t[0] for t in data]]
+            return self._pre_collate(tensors), torch.utils.data.default_collate(stats)
+
+    def __iter__(self):
+        iter_list = []
+        for k in self.data_buckets.keys():
+            iter_list.extend(self.data_buckets[k])
+        shuffle(iter_list)  # shuffle all the batches so they aren't ordered by bucket size
+        for i in iter_list:
+            def map_idx(indx, pid):
+                return self.unpad_pack(self.data_source[indx], pid, self.with_stats)
+            items = [map_idx(i, p) for (i, p) in i]
+            yield torch.utils.data.default_collate(items)  # as it was stored in an array
+
+    def __len__(self):
+        length = 0
+        for (k, l) in self.data_buckets.items():
+            length += len(l)
+        return length
+
+    def element_to_bucket_id(self, x, seq_length):
+        for i, b in enumerate(self.bucket_boundaries):
+            if seq_length < b:
+                return b
+        return self.bucket_boundaries[len(self.bucket_boundaries) - 1]
 
 
 class Trainer(ABC):
@@ -139,11 +254,13 @@ class Trainer(ABC):
         return Common.get_state_dict("checkpoint_last", path=save_dir)
 
     @abstractmethod
-    def encode(self, inputs, labels, tokenizer, return_entry_ids=False) -> Union[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[int]]]:
+    def encode(self, inputs, labels, tokenizer, return_entry_ids=False) -> Union[
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], tuple[
+            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[int]]]:
         pass
 
     def update_metrics(self, metrics: Metrics, batch, outputs):
-        metrics.update(batch, outputs)
+        metrics.update(batch, outputs.to(torch.float32))
 
     @abstractmethod
     def forward_to_model(self, model, criterion, batch):
@@ -164,7 +281,6 @@ class Trainer(ABC):
                 data = data[-cap_size:]
             set_size = len(data)
 
-
         # Log data metrics
         print(f"Dataset size: {len(data)}")
         print(f"Dataset input length span: [{len(data[0].get('i'))}, {len(data[set_size - 1].get('i'))}]")
@@ -182,8 +298,9 @@ class Trainer(ABC):
         inputs = [entry.get("i") for entry in data]
         labels = [entry.get("l") for entry in data]
 
-        entry_ids, input_ids, input_masks, label_ids, label_masks = self.encode(inputs=inputs, labels=labels, tokenizer=tokenizer, return_entry_ids=True)
-
+        entry_ids, input_ids, input_masks, label_ids, label_masks = self.encode(inputs=inputs, labels=labels,
+                                                                                tokenizer=tokenizer,
+                                                                                return_entry_ids=True)
 
         # Log Encoded lengths
         lengths = list(map(lambda x: torch.count_nonzero(x).item(), input_masks))
@@ -205,18 +322,25 @@ class Trainer(ABC):
             stats = [stats[i] for i in entry_ids]
             return (input_ids, input_masks, label_ids, label_masks), stats
 
-    def split_and_prepare(self, tokenizer, data, tokenizer_name, cap_size=-1, test_portion=0.3, train_portion=None, return_stats=False, take_longest=False):
+    def split_and_prepare(self, tokenizer, data, tokenizer_name, cap_size=-1, test_portion=0.3, train_portion=None,
+                        take_longest=False, force_encoding=False):
+
+        return_stats = "stats" in data[0]
+
+
 
         from_file_buffer = Common.load_tensor_data(tokenizer_name, return_stats=return_stats)
-        if not from_file_buffer:
+        if (not from_file_buffer) or force_encoding:
             print(f"No preprocessed data found for {tokenizer_name}. Preprocessing data instead.")
             data = self._process_data(tokenizer, data, return_stats, cap_size, take_longest)
             print(f"Preprocessing done. Saving data locally.")
             if return_stats:
                 data, stats = data
-                Common.save_tensor_data(tokenizer_name, data, stats)
+                if not force_encoding:
+                    Common.save_tensor_data(tokenizer_name, data, stats)
             else:
-                Common.save_tensor_data(tokenizer_name, data)
+                if not force_encoding:
+                    Common.save_tensor_data(tokenizer_name, data)
         else:
             data = from_file_buffer
             if return_stats:
@@ -228,7 +352,10 @@ class Trainer(ABC):
                 data = (tensor[sample_indices] for tensor in data)
                 if return_stats:
                     stats = [stats[i] for i in sample_indices]
-        input_ids, input_masks, label_ids, label_masks = data
+
+        num_tokens = self.hp.input_size
+        input_ids, input_masks, label_ids, label_masks = tuple(t[:, :num_tokens] for t in data)
+
 
         if not return_stats:
             # Split ids and masks for inputs and labels into test and training sets, respectively. Sorth by length.
@@ -237,7 +364,7 @@ class Trainer(ABC):
             train['in_ids'], test['in_ids'], train['in_masks'], test['in_masks'], \
             train['l_ids'], test['l_ids'], train['l_masks'], test['l_masks'] = \
                 train_test_split(input_ids, input_masks, label_ids, label_masks, test_size=test_portion,
-                                  random_state=420, shuffle=False)
+                                 random_state=420, shuffle=False)
             train_set = TensorDataset(*sort_by_length(*itemgetter('in_ids', 'in_masks', 'l_ids', 'l_masks')(train)))
             test_set = TensorDataset(*sort_by_length(*itemgetter('in_ids', 'in_masks', 'l_ids', 'l_masks')(test)))
 
@@ -249,12 +376,14 @@ class Trainer(ABC):
             test = {}
             train['in_ids'], test['in_ids'], train['in_masks'], test['in_masks'], \
             train['l_ids'], test['l_ids'], train['l_masks'], test['l_masks'], \
-                train_stats, test_stats = \
+            train_stats, test_stats = \
                 train_test_split(input_ids, input_masks, label_ids, label_masks, stats, test_size=test_portion,
-                                  random_state=420, shuffle=False)
+                                 random_state=420, shuffle=False)
 
-            train_tuples, train_indices = sort_by_length(*itemgetter('in_ids', 'in_masks', 'l_ids', 'l_masks')(train), True)
-            test_tuples, test_indices = sort_by_length(*itemgetter('in_ids', 'in_masks', 'l_ids', 'l_masks')(test), True)
+            train_tuples, train_indices = sort_by_length(*itemgetter('in_ids', 'in_masks', 'l_ids', 'l_masks')(train),
+                                                         True)
+            test_tuples, test_indices = sort_by_length(*itemgetter('in_ids', 'in_masks', 'l_ids', 'l_masks')(test),
+                                                       True)
 
             if train_portion:
                 train_size = int(len(train_tuples[0]) * train_portion)
@@ -271,15 +400,39 @@ class Trainer(ABC):
 
     def train(self, model, optimizer, tokenizer, criterion, data_set: torch.utils.data.Dataset, metrics: Metrics):
         device = self.hp.device
-        num_epochs = self.hp.num_epochs#
+        num_epochs = self.hp.num_epochs  #
         has_additional_info = True if isinstance(data_set, TensorListDataset) else False
-        data_loader = DataLoader(data_set, batch_size=self.hp.batch_size, shuffle=True, drop_last=True)
+
+        if self.hp.dynamic_batching:
+            data_loader = BucketLoader(data_set, [64, 128, 256, 512, 1024], batch_sizes=[16, 8, 4, 4, 2],
+                                       with_stats=has_additional_info)
+        else:
+            data_loader = DataLoader(data_set, batch_size=self.hp.batch_size, shuffle=True,
+                                     drop_last=True)  # No bucketing
+
+        # data_loader = DataLoader(data_set, batch_size=1, shuffle=False, drop_last=False, sampler=bucket_sampler, pin_memory=False)
         data_set_size = len(data_loader)
         print_every = self.hp.print_every if self.hp.print_every else int(data_set_size / 10)
         print_every = max(print_every, 1)
-        save_every = max(int(data_set_size / 3), 300)
+        save_every = max(int(data_set_size / 3), 100)
+
+        Timer.disable("Batch-wise")
+
+        # Memory Optimization
+
+        scaler = GradScaler()
+
+        def free_memory(batch):
+            for t in (batch if has_additional_info else batch[0]):
+                del t
+            gc.collect()
+            torch.cuda.empty_cache()
 
         print(">> Training Started <<")
+
+        Timer.start("Per-batch")
+
+
         for epoch in range(num_epochs):
             model.train()
             total_loss = 0
@@ -287,6 +440,9 @@ class Trainer(ABC):
 
             print("Starting Epoch: {}/{}".format(epoch + 1, num_epochs))
             for i, batch in enumerate(data_loader):
+
+                Timer.start("Batch-wise")
+
                 # Move all tensors to the device
                 if has_additional_info:
                     batch = tuple(tensor.to(device) for tensor in batch[0]), batch[1]
@@ -296,21 +452,32 @@ class Trainer(ABC):
                 # forward
                 optimizer.zero_grad()
                 tensor_batch = batch if not has_additional_info else batch[0]
-                outputs, loss = self.forward_to_model(model=model, criterion=criterion, batch=tensor_batch)
+
+                with torch.autocast(device_type=device):
+                    outputs, loss = self.forward_to_model(model=model, criterion=criterion, batch=tensor_batch)
+
+                Timer.measure("Batch-wise", tag="Forward")
 
                 # Update metrics
                 total_loss += loss.item()
                 self.update_metrics(metrics, batch, outputs)
 
                 # back propagate
-                loss.backward()
+                scaler.scale(loss).backward()
 
                 # Apply gradient clipping
                 if self.hp.max_norm > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=self.hp.max_norm)
+                Timer.measure("Batch-wise", tag="Clip")
 
-                # update optimizer
-                optimizer.step()
+                # Optimizer step
+                scaler.unscale_(optimizer)  # Unscale for gradient clipping
+                Timer.measure("Batch-wise", tag="Backward")
+
+                # update scaler & optimizer
+                scaler.step(optimizer)
+                scaler.update()
+                Timer.measure("Batch-wise", tag="Optimizer")
 
                 # print info
                 if (i + 1) % print_every == 0 or (i + 1) == data_set_size:
@@ -322,15 +489,22 @@ class Trainer(ABC):
                     metrics.print(index=i + 1, set_size=data_set_size, prefix=prefix, count=count, epoch=epoch,
                                   loss=total_loss, decoder=lambda x: self.decode_tokens(tokenizer, x))
 
+                    print(f"Learning Rate: {optimizer.param_groups[0]['lr']}")
                     total_loss = 0
                     metrics.reset()
-                    if device == "cuda":
-                        torch.cuda.empty_cache()
 
                 if (i + 1) % save_every == 0 or (i + 1) == data_set_size:
                     self.save(model, loss.item(), optimizer)
 
-    def test(self, model, optimizer, tokenizer, criterion, data_set, metrics: Metrics, split_into_two=False, generate=False, log_prefix=None, pad_output_to=-1):
+                if i > 0 and i % 25 == 0:
+                    Timer.measure("Per-batch", avg_over=25)
+
+                # free_memory(batch)
+
+                Timer.measure("Batch-wise", tag="Memory-freeing")
+
+    def test(self, model, optimizer, tokenizer, criterion, data_set, metrics: Metrics, split_into_two=False,
+             generate=False, log_prefix=None, pad_output_to=-1):
         device = self.hp.device
         has_additional_info = True if isinstance(data_set, TensorListDataset) else False
         data_loader = DataLoader(data_set, batch_size=self.hp.batch_size, shuffle=False, drop_last=True)
@@ -340,6 +514,7 @@ class Trainer(ABC):
         if has_additional_info:
             print_every = 1
         metrics.reset()
+
 
         print(">> Evaluation Started <<")
         with torch.no_grad():
@@ -353,7 +528,6 @@ class Trainer(ABC):
                 else:
                     batch = tuple(tensor.to(device) for tensor in batch)
                 tensor_batch = batch if not has_additional_info else batch[0]
-
                 # forward
                 optimizer.zero_grad()
 
@@ -391,10 +565,7 @@ class Trainer(ABC):
                     metrics.print(index=i + 1, set_size=data_set_size, prefix=prefix, count=count, epoch=0,
                                   loss=total_loss, decoder=lambda x: self.decode_tokens(tokenizer, x))
 
-
                     total_loss = 0
                     metrics.reset()
                     if device == "cuda":
                         torch.cuda.empty_cache()
-
-

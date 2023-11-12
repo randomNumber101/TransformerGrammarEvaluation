@@ -28,6 +28,7 @@ class HyperParams:
 
         self.learning_rate = 1e-4
         self.max_norm = -1  # Used for gradient clipping
+        self.dynamic_batching = False
 
         # Printing
         self.print_every = None
@@ -51,6 +52,8 @@ def overwrite_params(hps: HyperParams, overwrite: typing.Dict[str, object]):
             hps.max_norm = float(val)
         elif k == "print_every":
             hps.print_every = int(val)
+        elif k == "dynamic_batching":
+            hps.dynamic_batching = bool(val)
     return hps
 
 
@@ -59,18 +62,25 @@ def loadParams():
     parser.add_argument('-d', '--set_name', type=str, help="The data set", required=True)
     parser.add_argument('-m', '--model', type=str, help="Model to use [TRANSF, LSTM, BART]", default="TRANSF"),
     parser.add_argument('-bs', '--batch_size', type=int, help="Batch size")
-    parser.add_argument('-is', '--input_size', type=int, help="Input (and output) Length of the network")
+    parser.add_argument('-is', '--input_size', type=int, help="Input (and output) Length of the network", default=512)
     parser.add_argument('-epochs', '--num_epochs', type=int, help="Epoch count")
     parser.add_argument('-lr', '--learning_rate', type=float, help="Learning rate")
+    parser.add_argument('-wu', '--warmup', type=float, help="Warmup steps", default=4000)
+    parser.add_argument('-dynamic', "--dynamic_batching", help="Bucket sequences per length into batches", action='store_true')
     parser.add_argument('-mn', "--max_norm", type=float, help="Maximal gradient for gradient clipping")
     parser.add_argument('-pe', '--print_every', type=int, help="Frequency of logging results")
     parser.add_argument('-test', '--test_mode', help="Test mode. Deactivates wandb.", action='store_true')
     parser.add_argument('-l', '--layers', type=int, help="Number of layers", default=-1)
     parser.add_argument('-tok', '--tokenize', type=str, help="Tokenization strategy [bpe, words, pure_bpe]",
                         default="bpe")
+    parser.add_argument('-lang', "--tok_lang", help="Language of the tokenizer (de, eng, auto).", default="auto")
+    parser.add_argument('-tokname', "--tokenizer_name", type=str, help="The name of the tokenizer to load", default=None)
     parser.add_argument('-eval', '--eval', help="Evaluation mode. Supply dataset.", action='store_true')
     parser.add_argument('--eval_from', help="Dataset to use for evaluation", type=str, default=None)
     parser.add_argument("-load", '--load', help="Loads models_data from pth file.", action='store_true')
+
+    parser.add_argument("-init", "--init_from", help="Load weigths trained on other set.", type=str, default=None)
+
     parser.add_argument('-ds', '--set_size', type=int, help="How much of the dataset to load. Default: -1.", default=-1)
     parser.add_argument('-bracket', '--bracket_depth', help="Sort eval set by bracket depth (labels).",
                         action='store_true')
@@ -83,6 +93,7 @@ def loadParams():
 
     parser.add_argument('-nopre', "--no_pretrained_weight", help="Initialize models without pretrained weights", action="store_true")
 
+    parser.add_argument("-tag", "--model_tag", type=str, help="Additional Tags to add to saved models", default=None)
 
     args = parser.parse_args()
 
@@ -212,10 +223,13 @@ def save_tokenizer(tokenizer: PreTrainedTokenizer, set_name, word_wise=False):
 def load_tokenizer(baseclass: PreTrainedTokenizer, set_name, word_wise=False):
     path = os.path.join(tokenizer_folder, get_tokenizer_name(set_name, word_wise))
     if os.path.exists(path):
-        tokenizer = baseclass.from_pretrained(path)
-        if word_wise:
-            return tokenizer.word_wise()
-        return tokenizer
+        try:
+            tokenizer = baseclass.from_pretrained(path)
+            if word_wise:
+                return tokenizer.word_wise()
+            return tokenizer
+        except:
+            return None
     return None
 
 

@@ -251,7 +251,7 @@ class ClassificationTrainer(TrainUtil.Trainer):
         self.mask_string = mask_string
 
     def update_metrics(self, metrics: TrainUtil.Metrics, batch, outputs):
-        metrics.update(batch, outputs.logits)
+        metrics.update(batch, outputs.logits.to(torch.float32))
 
     def decode_single(self, tokenizer, x):
         if x is None or len(x.size()) < 1:
@@ -320,7 +320,7 @@ class ClassificationTrainer(TrainUtil.Trainer):
 class SimpleClassificationTrainer(ClassificationTrainer):
 
     def update_metrics(self, metrics: TrainUtil.Metrics, batch, outputs):
-        metrics.update(batch, outputs)
+        metrics.update(batch, outputs.to(torch.float32))
 
     def forward_to_model(self, model: BaseLines.SimpleClassifier, criterion, batch):
         in_ids, in_masks, enc_labels, _ = batch
@@ -332,7 +332,7 @@ class SimpleClassificationTrainer(ClassificationTrainer):
 class LSTMClassificationTrainer(ClassificationTrainer):
 
     def update_metrics(self, metrics: TrainUtil.Metrics, batch, outputs):
-        metrics.update(batch, outputs)
+        metrics.update(batch, outputs.to(torch.float32))
 
     def __init__(self, hp, tokenizer, label_encoder):
         super().__init__(hp, label_encoder)

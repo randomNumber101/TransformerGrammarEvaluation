@@ -46,10 +46,8 @@ hp.max_norm = 5.0
 
 def main():
     args, hp = Common.loadParams()
-    args.learning_rate = 1e-5
-    args.max_norm = 0.75
     hp.learning_rate = args.learning_rate
-    hp.max_norm = args.max_norm
+    hp.max_norm = args.max_norm if args.max_norm else -1
 
     model_name = "BERT" if args.model == "TRANSF" else args.model
     model_postfix = "SMALL" if args.layers > 0 else "PRETRAINED"
@@ -115,7 +113,7 @@ def main():
     #
     if model_name == "BERT" or model_name == "BART":
         trainer = ClassificationTrainer(hp, label_encoder=label_encoder)
-    elif model_name == "LSTM":
+    elif model_name == "LSTM" or model_name == "SIMPLE_LSTM":
         trainer = LSTMClassificationTrainer(hp, tokenizer, label_encoder)
     elif model_name == "SIMPLE":
         trainer = SimpleClassificationTrainer(hp, label_encoder=label_encoder)
@@ -147,9 +145,10 @@ def main():
         training_set_name.replace(".json", ""),
         model_name,
         model_postfix,
-        args.tokenize,
-        args.eval_from if args.eval_from else ()
+        args.tokenize
     ]
+    if args.eval_from:
+        tags.append(args.eval_from)
     wandb_mode = 'disabled' if args.test_mode else 'online'
     wandb_project = task if not args.wandb_project else args.wandb_project
     wandb.init(project=wandb_project, config=config, tags=tags, mode=wandb_mode)
@@ -158,10 +157,10 @@ def main():
 
     # Split and prepare training data
     if task == "Masking":
-        return_stats, take_longest = True, True
+        take_longest = True
         test_portion, train_portion = (0.2, 0.1) if args.set_size < 0 or not args.eval else (0.99, None)
     else:
-        return_stats, take_longest = False, False
+        take_longest = False
         test_portion, train_portion = 0.3, None
     if args.eval_from:
         evaluation_set_name = args.eval_from
@@ -169,7 +168,7 @@ def main():
         print("Loaded evaluation dataset: " + evaluation_set_name)
         tokenizer_name = Common.get_tokenizer_name(evaluation_set_name, word_wise)
     train_set, test_set = trainer.split_and_prepare(tokenizer, dataset['data'], tokenizer_name, cap_size=args.set_size,
-                                                    return_stats=return_stats, take_longest=take_longest,
+                                                    take_longest=take_longest,
                                                     train_portion=train_portion, test_portion=test_portion)
     if save_tokenizer:
         Common.save_tokenizer(tokenizer, training_set_name, word_wise)
@@ -184,6 +183,7 @@ def main():
     # Define Model
     #
 
+    d_model = None
     if model_name == "BERT":
         config = BertConfig.from_pretrained('bert-base-uncased')
         if args.layers <= 0:
@@ -195,7 +195,7 @@ def main():
         model.resize_token_embeddings(len(tokenizer))
         metrics = ClassificationMetrics(label_encoder)
         optimizer = AdamW(model.parameters(), lr=hp.learning_rate)
-        # optimizer = TrainUtil.NoamOptim(optimizer, config.hidden_size)
+        d_model = config.hidden_size
 
     elif model_name == "BART":
         config = BartConfig.from_pretrained('facebook/bart-base')
@@ -208,7 +208,7 @@ def main():
         model.resize_token_embeddings(len(tokenizer))
         metrics = ClassificationMetrics(label_encoder)
         optimizer = AdamW(model.parameters(), lr=hp.learning_rate)
-        # optimizer = TrainUtil.NoamOptim(optimizer, config.d_model)
+        d_model = config.d_model
 
     elif model_name == "SIMPLE":
         args.layers = 6 if args.layers < 0 else args.layers
@@ -217,17 +217,30 @@ def main():
                                            num_layers=args.layers)
         metrics = ClassificationMetrics(label_encoder)
         optimizer = AdamW(model.parameters(), lr=hp.learning_rate)
-        # optimizer = TrainUtil.NoamOptim(optimizer, 512)
+        d_model = 512
 
     elif model_name == "LSTM":
         args.layers = 1
         model = BaseLines.BiLSTMClassifier(len(tokenizer), len(label_encoder.classes_), input_dim=256, hidden_dim=1024)
         metrics = ClassificationMetrics(label_encoder)
         optimizer = AdamW(model.parameters(), lr=hp.learning_rate)
-        # optimizer = TrainUtil.NoamOptim(optimizer, 1024)
+        d_model = 512
+
+    elif model_name == "SIMPLE_LSTM":
+        if args.layers < 0:
+            args.layers = 1
+        model = BaseLines.SimpleLSTM(len(tokenizer), len(label_encoder.classes_), input_dim=256, hidden_dim=1024, num_layers=args.layers)
+        metrics = ClassificationMetrics(label_encoder)
+        optimizer = AdamW(model.parameters(), lr=hp.learning_rate)
+        d_model = 512
 
     else:
         raise NotImplementedError("No such model implemented: " + model_name)
+
+    if not args.no_optimizer:
+        optimizer = TrainUtil.NoamOptim(optimizer, d_model, n_warmup_steps=args.warmup)
+
+
     model.to(device=hp.device)
 
     # Initialize criterion
@@ -247,7 +260,7 @@ def main():
     )
     trainer.save_dir = save_path
 
-    if not args.eval:
+    if not args.eval and not args.eval_from:
         trainer.train(model=model, optimizer=optimizer, tokenizer=tokenizer, criterion=criterion, data_set=train_set,
                       metrics=metrics)
 
@@ -282,7 +295,6 @@ def certainty(y_true, y_pred):
 '''
 METRICS
 '''
-
 
 class ClassificationMetrics(TrainUtil.Metrics):
     def __init__(self, label_encoder: LabelEncoder):
@@ -397,6 +409,68 @@ class ClassificationMetrics(TrainUtil.Metrics):
         self.additional_metrics = {}
 
 
+class BasicClassificationMetrics(ClassificationMetrics):
+
+    def __init__(self, label_encoder: LabelEncoder):
+        super().__init__(label_encoder)
+        self.acc = 0
+        self.log_num = 0
+        self.current_prefix = "<init>"
+        self.last_prefix = ""
+        self.current_step = 0
+        self.additional_metrics = {}
+
+    def update(self, batch, outputs):
+        tensor_batch = batch[0] if len(batch) == 2 else batch
+        additional_infos = batch[1] if len(batch) == 2 else {}
+
+        input_ids, in_masks, labels, _ = tensor_batch
+
+        # Move to CPU
+        in_masks = in_masks
+        labels = labels
+        outputs = outputs
+        predicted = torch.argmax(outputs, dim=1)
+
+        self.update_additional_metrics(additional_infos)
+        self.acc += ((labels == predicted).sum().item() / labels.numel())
+
+    def print(self, index, set_size, prefix, count, epoch, loss, decoder=None):
+        if prefix != self.last_prefix:
+            self.last_prefix = prefix
+            self.current_step = 0
+
+        avg_loss = loss / count
+        f1 = accuracy = self.acc / count
+
+        self.average_additional_metrics(count)
+        additional_str = ""
+        for key, value in self.additional_metrics.items():
+            additional_str += f", {key}: {str(value.item())}"
+
+        print(
+            f"Batch {index}/{set_size} - Loss: {avg_loss:.4f}, Accuracy: {accuracy:.4f}, F1: {f1:.4f}, {additional_str}")
+
+
+        additional_metrics = {prefix + key: value for key, value in self.additional_metrics.items()}
+        log_dict = {
+            prefix + "epoch": epoch,
+            prefix + "loss": avg_loss,
+            prefix + "accuracy": accuracy,
+            prefix + "f1": f1,
+            prefix + "custom_step": self.current_step,
+        }
+        log_dict.update(additional_metrics)
+        wandb.log(log_dict)
+
+        self.current_step += 1
+
+    def reset(self):
+        self.acc = 0
+        self.additional_metrics = {}
+
+
+
 '''
 TRAINERS
 '''
@@ -414,7 +488,7 @@ class ClassificationTrainer(TrainUtil.Trainer):
         self.mask_string = mask_string
 
     def update_metrics(self, metrics: TrainUtil.Metrics, batch, outputs):
-        metrics.update(batch, outputs.logits)
+        metrics.update(batch, outputs.logits.to(torch.float32))
 
     def decode_single(self, tokenizer, x):
         if x is None or len(x.size()) < 1:
@@ -487,7 +561,7 @@ class ClassificationTrainer(TrainUtil.Trainer):
 class SimpleClassificationTrainer(ClassificationTrainer):
 
     def update_metrics(self, metrics: TrainUtil.Metrics, batch, outputs):
-        metrics.update(batch, outputs)
+        metrics.update(batch, outputs.to(torch.float32))
 
     def forward_to_model(self, model: BaseLines.SimpleClassifier, criterion, batch):
         in_ids, in_masks, enc_labels, _ = batch
@@ -499,7 +573,7 @@ class SimpleClassificationTrainer(ClassificationTrainer):
 class LSTMClassificationTrainer(ClassificationTrainer):
 
     def update_metrics(self, metrics: TrainUtil.Metrics, batch, outputs):
-        metrics.update(batch, outputs)
+        metrics.update(batch, outputs.to(torch.float32))
 
     def __init__(self, hp, tokenizer, label_encoder):
         super().__init__(hp, label_encoder)
@@ -523,6 +597,8 @@ class LSTMClassificationTrainer(ClassificationTrainer):
 
         # Pass and return
         out = model(in_ids, in_masks, in_len)
+        if len(out.shape) == 1:
+            out = out.unsqueeze(0)
         loss = criterion(out.contiguous().view(-1, out.size(-1)), labels.contiguous().view(-1))
         return out, loss
 

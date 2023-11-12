@@ -6,8 +6,10 @@ import torch
 import torch.nn as nn
 from torch import nn as nn
 from torch.nn import Transformer
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from transformers.models.bart.modeling_bart import BartClassificationHead
 
+import ModelImpl
 from ModelImpl import LegacySeq2SeqBiLSTM, BahdanauAttention, Encoder, Decoder, Generator, AttentionClassificationHead, \
     PositionalEncoding
 
@@ -15,7 +17,7 @@ from transformers import BartForSequenceClassification
 
 
 class SimpleTransformer(nn.Module):
-    def __init__(self, vocab_size: int, ntokens=512, d_model=512, num_layers=6, bidirectional=False, device="cpu"):
+    def __init__(self, vocab_size: int, ntokens=1024, d_model=512, num_layers=6, bidirectional=False, device="cpu"):
         super().__init__()
         self.d_model = d_model
         self.src_embed = nn.Embedding(vocab_size, self.d_model)
@@ -76,7 +78,6 @@ class SimpleClassifier(nn.Module):
         self.device = device
 
     def forward(self, input_ids, mask):
-
         mask = mask == 0.0
 
         x = self.embedding(input_ids)
@@ -158,6 +159,26 @@ class Seq2SeqBiLSTM(nn.Module):
     def to(self, device):
         super(Seq2SeqBiLSTM, self).to(device)
         self.device = device
+
+
+class SimpleLSTM(nn.Module):
+    def __init__(self, vocab_size: int, num_classes: int, input_dim=256, hidden_dim=512, num_layers=1, dropout=0.):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, input_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.lstm = nn.LSTM(input_size=input_dim, hidden_size=hidden_dim, batch_first=True, num_layers=num_layers)
+        self.classification_head = ModelImpl.SimpleClassificationHead(hidden_dim, num_classes, bidirectional=False)
+
+    def forward(self, src, src_mask, src_lengths):
+        embedded = self.dropout(self.embed(src))
+        packed_x = pack_padded_sequence(embedded, src_lengths, enforce_sorted=False, batch_first=True)
+        packed_out, (hidden, cell) = self.lstm(packed_x)
+        # output = pad_packed_sequence(packed_out, batch_first=True)
+
+        last_hidden_state = hidden[-1, :, :]
+        # last_hidden_state: [batch_size, hidden_dim]
+
+        return self.classification_head(last_hidden_state)
 
 
 class BiLSTMClassifier(nn.Module):
