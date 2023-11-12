@@ -398,7 +398,7 @@ class Trainer(ABC):
 
             return TensorListDataset(train_set, train_stats), TensorListDataset(test_set, test_stats)
 
-    def train(self, model, optimizer, tokenizer, criterion, data_set: torch.utils.data.Dataset, metrics: Metrics):
+    def train(self, model, optimizer, tokenizer, criterion, data_set: torch.utils.data.Dataset, metrics: Metrics, print_eval=False):
         device = self.hp.device
         num_epochs = self.hp.num_epochs  #
         has_additional_info = True if isinstance(data_set, TensorListDataset) else False
@@ -500,7 +500,6 @@ class Trainer(ABC):
                     Timer.measure("Per-batch", avg_over=25)
 
                 # free_memory(batch)
-
                 Timer.measure("Batch-wise", tag="Memory-freeing")
 
     def test(self, model, optimizer, tokenizer, criterion, data_set, metrics: Metrics, split_into_two=False,
